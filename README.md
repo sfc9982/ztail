@@ -2,7 +2,7 @@
 
 `tail` for gzip files that does **not** re-decompress the file on every poll.
 
-The original Crystal program (`legacy/ztail.cr`) opened the file, inflated it from the first byte, and repeated that every 500 ms. CPU and I/O were proportional to the whole file, forever. This Rust version keeps the file open, remembers the byte offset, and feeds only newly appended bytes into a persistent streaming inflater (`flate2`'s low-level `Decompress`, on the pure-Rust `zlib-rs` backend). Each poll is O(new bytes).
+The original Crystal program (branch [`cursor/legacy-crystal-1065`](https://github.com/sfc9982/ztail/tree/cursor/legacy-crystal-1065)) opened the file, inflated it from the first byte, and repeated that every 500 ms. CPU and I/O were proportional to the whole file, forever. This Rust version keeps the file open, remembers the byte offset, and feeds only newly appended bytes into a persistent streaming inflater (`flate2`'s low-level `Decompress`, on the pure-Rust `zlib-rs` backend). Each poll is O(new bytes).
 
 Following is **off by default**, matching GNU `tail`. The old program always followed. Pass `-f` or `-F` when you want that.
 
@@ -77,4 +77,6 @@ Unit tests cover single-member and multi-member gzip (including one-byte splits 
 
 ## Legacy
 
-`legacy/ztail.cr` is the original Crystal implementation, kept for comparison. It is not built.
+The original Crystal implementation is preserved on branch
+[`cursor/legacy-crystal-1065`](https://github.com/sfc9982/ztail/tree/cursor/legacy-crystal-1065)
+(`ztail.cr`). It is not part of this tree.
