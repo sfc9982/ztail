@@ -1,5 +1,9 @@
 # ztail
 
+> This branch (`cursor/legacy-crystal-1065`) preserves the original Crystal
+> implementation. The Rust rewrite with incremental inflate lives on
+> `cursor/rust-ztail-1065` (and will become `main` after that PR merges).
+
 Like the linux `tail` command but for gzip compressed files
 
 # Usage
