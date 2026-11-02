@@ -4,10 +4,14 @@
 //! directory of each file is watched so rotation (`rename` + create) and
 //! appends both wake us. If the watcher cannot be created, or an event is
 //! lost, the caller still polls on the `-s` interval.
+//!
+//! Events are coalesced into a capacity-1 channel: a pending wake is enough.
+//! The follow loop does not need every modify event, only a signal that
+//! something changed, so the queue cannot grow without bound.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
 use notify::{RecursiveMode, Watcher};
@@ -15,13 +19,21 @@ use notify::{RecursiveMode, Watcher};
 pub struct Watch {
     /// Held so the inotify watches stay registered. Not read after setup.
     _watcher: Option<notify::RecommendedWatcher>,
-    rx: Option<Receiver<notify::Result<notify::Event>>>,
+    rx: Option<Receiver<()>>,
 }
 
 impl Watch {
     pub fn new(paths: &[PathBuf]) -> Self {
-        let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
-        match notify::RecommendedWatcher::new(tx, notify::Config::default()) {
+        // Capacity 1: try_send drops when a wake is already queued.
+        let (tx, rx) = mpsc::sync_channel::<()>(1);
+        match notify::RecommendedWatcher::new(
+            move |res: notify::Result<notify::Event>| {
+                // Ignore the event payload; any change is enough to wake.
+                let _ = res;
+                wake(&tx);
+            },
+            notify::Config::default(),
+        ) {
             Ok(mut watcher) => {
                 let mut dirs = HashSet::new();
                 let mut warned = false;
@@ -71,23 +83,36 @@ impl Watch {
             return;
         };
         let start = Instant::now();
-        while start.elapsed() < timeout {
+        loop {
+            let Some(remaining) = timeout.checked_sub(start.elapsed()) else {
+                return;
+            };
+            if remaining.is_zero() {
+                return;
+            }
             if stop() {
                 return;
             }
-            let slice = (timeout - start.elapsed()).min(Duration::from_millis(200));
+            let slice = remaining.min(Duration::from_millis(200));
             match rx.recv_timeout(slice) {
-                Ok(_) => {
+                Ok(()) => {
                     while rx.try_recv().is_ok() {}
                     return;
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => {
                     sleep_until(timeout.saturating_sub(start.elapsed()), stop);
                     return;
                 }
             }
         }
+    }
+}
+
+fn wake(tx: &SyncSender<()>) {
+    match tx.try_send(()) {
+        Ok(()) | Err(TrySendError::Full(())) => {}
+        Err(TrySendError::Disconnected(())) => {}
     }
 }
 
@@ -100,12 +125,17 @@ fn parent_dir(path: &Path) -> PathBuf {
 
 fn sleep_until(timeout: Duration, stop: &dyn Fn() -> bool) {
     let start = Instant::now();
-    while start.elapsed() < timeout {
+    loop {
+        let Some(remaining) = timeout.checked_sub(start.elapsed()) else {
+            return;
+        };
+        if remaining.is_zero() {
+            return;
+        }
         if stop() {
             return;
         }
-        let slice = (timeout - start.elapsed()).min(Duration::from_millis(200));
-        std::thread::sleep(slice);
+        std::thread::sleep(remaining.min(Duration::from_millis(200)));
     }
 }
 
@@ -140,5 +170,15 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "event wait took {elapsed:?}; inotify did not wake the follower"
         );
+    }
+
+    #[test]
+    fn wait_with_tiny_timeout_does_not_panic() {
+        let watch = Watch {
+            _watcher: None,
+            rx: None,
+        };
+        watch.wait(Duration::from_nanos(1), &|| false);
+        sleep_until(Duration::from_nanos(1), &|| false);
     }
 }

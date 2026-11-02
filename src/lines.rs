@@ -3,6 +3,12 @@
 //! A follow-mode reader must not print a partial last line and then print it
 //! again when the rest arrives. Bytes are emitted only once a `\n` is seen.
 //! The newline byte is kept on the line so the output is a faithful copy.
+//!
+//! Incomplete lines are capped at [`MAX_PARTIAL_LINE`]. A longer record is
+//! force-emitted in chunks so a newline-free payload cannot grow without bound.
+
+/// Hard cap on a buffered incomplete line (1 MiB).
+pub const MAX_PARTIAL_LINE: usize = 1024 * 1024;
 
 /// Splits an unstructured byte stream into complete lines.
 #[derive(Debug, Default)]
@@ -20,7 +26,9 @@ impl LineBuffer {
     /// Append decompressed (or plain) bytes.
     ///
     /// Returns every line that became complete, including its trailing `\n`.
-    /// A trailing fragment with no newline stays buffered.
+    /// A trailing fragment with no newline stays buffered, unless it exceeds
+    /// [`MAX_PARTIAL_LINE`], in which case it is force-emitted without a
+    /// newline so memory stays bounded.
     pub fn push(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
         let mut lines = Vec::new();
         let mut start = 0;
@@ -33,6 +41,10 @@ impl LineBuffer {
         }
         if start < data.len() {
             self.partial.extend_from_slice(&data[start..]);
+            while self.partial.len() > MAX_PARTIAL_LINE {
+                let rest = self.partial.split_off(MAX_PARTIAL_LINE);
+                lines.push(std::mem::replace(&mut self.partial, rest));
+            }
         }
         lines
     }
@@ -126,5 +138,15 @@ mod tests {
         let mut ring = VecDeque::new();
         retain_last(&mut ring, 0, b"a\n".to_vec());
         assert!(ring.is_empty());
+    }
+
+    #[test]
+    fn oversized_partial_is_force_emitted() {
+        let mut buf = LineBuffer::new();
+        let chunk = vec![b'x'; MAX_PARTIAL_LINE + 10];
+        let lines = buf.push(&chunk);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].len(), MAX_PARTIAL_LINE);
+        assert_eq!(buf.partial().len(), 10);
     }
 }

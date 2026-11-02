@@ -7,6 +7,11 @@
 //! onto a different file, so the descriptor is reopened and the decoder reset.
 //! A shrink of the open file (copytruncate, or `O_TRUNC`) does the same rewind
 //! on both `-f` and `-F`: the bytes we already decoded are gone.
+//!
+//! Truncate-and-regrow that finishes at or past the saved offset between polls
+//! is detected with a short content fingerprint of the bytes just behind the
+//! cursor. Each consume snapshots the end offset (and a byte budget) so a
+//! writer that outpaces the reader cannot starve other files or Ctrl+C.
 
 use std::fs::{File, Metadata};
 use std::io::{self, Read, Seek, SeekFrom};
@@ -16,6 +21,10 @@ use crate::decode::Decoder;
 use crate::lines::{retain_last, LineBuffer};
 
 const CHUNK: usize = 64 * 1024;
+/// Cap how much one poll/consume will read so follow stays responsive.
+const MAX_BYTES_PER_CONSUME: u64 = 8 * 1024 * 1024;
+/// Bytes kept just behind the cursor to detect truncate-and-regrow.
+const FINGERPRINT: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Notice {
@@ -44,6 +53,9 @@ impl Notice {
 pub struct Update {
     pub lines: Vec<Vec<u8>>,
     pub notice: Option<Notice>,
+    /// Format error after some lines were already decoded. Callers should
+    /// print `lines` and then treat the file as failed.
+    pub error: Option<TailError>,
 }
 
 #[derive(Debug)]
@@ -79,10 +91,19 @@ impl TailError {
     }
 }
 
+struct NameChange {
+    notice: Notice,
+    drained: Vec<Vec<u8>>,
+}
+
 pub struct TailFile {
     path: PathBuf,
     file: Option<File>,
     offset: u64,
+    /// Last observed size of the open file; used with the fingerprint.
+    last_size: u64,
+    /// Content just behind `offset`, used to catch truncate-and-regrow.
+    fingerprint: Vec<u8>,
     dev: u64,
     ino: u64,
     decoder: Decoder,
@@ -92,10 +113,19 @@ pub struct TailFile {
     follow_name: bool,
     did_initial: bool,
     missing_announced: bool,
+    /// Upper bound for the current `consume` call; `None` means use live size.
+    read_until: Option<u64>,
 }
 
 impl TailFile {
     pub fn open(path: &Path, follow_name: bool) -> Result<Self, TailError> {
+        // Stat first so a FIFO without a writer cannot hang `open`.
+        // Stat first so a FIFO without a writer cannot hang `File::open`.
+        let meta = std::fs::metadata(path).map_err(|source| TailError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        require_regular(path, &meta)?;
         let file = File::open(path).map_err(|source| TailError::Io {
             path: path.to_path_buf(),
             source,
@@ -104,17 +134,14 @@ impl TailFile {
             path: path.to_path_buf(),
             source,
         })?;
-        if meta.is_dir() {
-            return Err(TailError::Format {
-                path: path.to_path_buf(),
-                message: "is a directory".into(),
-            });
-        }
+        require_regular(path, &meta)?;
         let (dev, ino) = file_id(&meta);
         Ok(Self {
             path: path.to_path_buf(),
             file: Some(file),
             offset: 0,
+            last_size: meta.len(),
+            fingerprint: Vec::new(),
             dev,
             ino,
             decoder: Decoder::new(),
@@ -123,6 +150,7 @@ impl TailFile {
             follow_name,
             did_initial: false,
             missing_announced: false,
+            read_until: None,
         })
     }
 
@@ -132,6 +160,8 @@ impl TailFile {
             path: path.to_path_buf(),
             file: None,
             offset: 0,
+            last_size: 0,
+            fingerprint: Vec::new(),
             dev: 0,
             ino: 0,
             decoder: Decoder::new(),
@@ -140,6 +170,7 @@ impl TailFile {
             follow_name,
             did_initial: false,
             missing_announced: true,
+            read_until: None,
         }
     }
 
@@ -162,64 +193,69 @@ impl TailFile {
     /// Single forward pass. Keeps the last `n` complete lines.
     ///
     /// `flush` is set when we are about to exit: a leftover sniff prefix is
-    /// treated as text. While following, a short prefix might still grow into
-    /// a gzip or zstd header, so it is left buffered.
+    /// treated as text, and an incomplete compressed member is an error.
+    /// While following, a short prefix might still grow into a gzip or zstd
+    /// header, so it is left buffered.
     pub fn read_initial(&mut self, n: usize, flush: bool) -> Result<Vec<Vec<u8>>, TailError> {
         self.n = n;
-        let lines = self.consume(Some(n), flush)?;
+        let (lines, error) = self.consume(Some(n), flush)?;
         self.did_initial = true;
+        if let Some(err) = error {
+            return Err(err);
+        }
         Ok(lines)
     }
 
     /// Read whatever was appended, and apply rotation / truncation policy.
     pub fn poll(&mut self) -> Result<Update, TailError> {
         if self.follow_name {
-            if let Some(notice) = self.sync_name()? {
-                let lines = match notice {
-                    // First time we see the file: same initial view as startup.
+            if let Some(change) = self.sync_name()? {
+                let (mut lines, error) = match change.notice {
                     Notice::Appeared => {
                         let n = self.n;
-                        let lines = self.consume(Some(n), false)?;
+                        let result = self.consume(Some(n), false)?;
                         self.did_initial = true;
-                        lines
+                        result
                     }
-                    Notice::Inaccessible => Vec::new(),
-                    // New inode: every complete line currently in the file is
-                    // data we have not printed. Do not cap it at N.
+                    Notice::Inaccessible => (Vec::new(), None),
                     Notice::Replaced | Notice::Truncated => self.consume(None, false)?,
                 };
+                if !change.drained.is_empty() {
+                    let mut combined = change.drained;
+                    combined.append(&mut lines);
+                    lines = combined;
+                }
                 return Ok(Update {
                     lines,
-                    notice: Some(notice),
+                    notice: Some(change.notice),
+                    error,
                 });
             }
         }
 
         if self.file.is_some() && self.truncated()? {
             self.rewind()?;
-            let lines = self.consume(None, false)?;
+            let (lines, error) = self.consume(None, false)?;
             return Ok(Update {
                 lines,
                 notice: Some(Notice::Truncated),
+                error,
             });
         }
 
-        let lines = self.consume(None, false)?;
+        let (lines, error) = self.consume(None, false)?;
         Ok(Update {
             lines,
             notice: None,
+            error,
         })
     }
 
-    fn sync_name(&mut self) -> Result<Option<Notice>, TailError> {
+    /// Returns `(notice, lines drained from the old descriptor)`.
+    fn sync_name(&mut self) -> Result<Option<NameChange>, TailError> {
         match std::fs::metadata(&self.path) {
             Ok(meta) => {
-                if meta.is_dir() {
-                    return Err(TailError::Format {
-                        path: self.path.clone(),
-                        message: "is a directory".into(),
-                    });
-                }
+                require_regular(&self.path, &meta)?;
                 let (dev, ino) = file_id(&meta);
                 let changed = match &self.file {
                     None => true,
@@ -233,17 +269,36 @@ impl TailFile {
                 } else {
                     Notice::Replaced
                 };
-                self.reopen_with(meta)?;
-                Ok(Some(notice))
+                // Drain unread bytes from the old inode before replacing it.
+                let drained = if self.file.is_some() {
+                    let (lines, error) = self.consume(None, false)?;
+                    if let Some(err) = error {
+                        return Err(err);
+                    }
+                    lines
+                } else {
+                    Vec::new()
+                };
+                self.reopen()?;
+                Ok(Some(NameChange { notice, drained }))
             }
             Err(source) if source.kind() == io::ErrorKind::NotFound => {
                 if self.file.is_some() && !self.missing_announced {
+                    let (drained, error) = self.consume(None, false)?;
+                    if let Some(err) = error {
+                        return Err(err);
+                    }
                     self.file = None;
                     self.offset = 0;
+                    self.last_size = 0;
+                    self.fingerprint.clear();
                     self.decoder.reset();
                     self.lines.clear();
                     self.missing_announced = true;
-                    return Ok(Some(Notice::Inaccessible));
+                    return Ok(Some(NameChange {
+                        notice: Notice::Inaccessible,
+                        drained,
+                    }));
                 }
                 Ok(None)
             }
@@ -254,24 +309,33 @@ impl TailFile {
         }
     }
 
-    fn reopen_with(&mut self, meta: Metadata) -> Result<(), TailError> {
+    fn reopen(&mut self) -> Result<(), TailError> {
         let file = File::open(&self.path).map_err(|source| TailError::Io {
             path: self.path.clone(),
             source,
         })?;
+        // Identity must come from the descriptor we opened, not an earlier
+        // path lookup that can race with another rotation.
+        let meta = file.metadata().map_err(|source| TailError::Io {
+            path: self.path.clone(),
+            source,
+        })?;
+        require_regular(&self.path, &meta)?;
         let (dev, ino) = file_id(&meta);
         self.file = Some(file);
         self.dev = dev;
         self.ino = ino;
         self.offset = 0;
+        self.last_size = meta.len();
+        self.fingerprint.clear();
         self.decoder.reset();
         self.lines.clear();
         self.missing_announced = false;
         Ok(())
     }
 
-    fn truncated(&self) -> Result<bool, TailError> {
-        let Some(file) = &self.file else {
+    fn truncated(&mut self) -> Result<bool, TailError> {
+        let Some(file) = &mut self.file else {
             return Ok(false);
         };
         let len = file
@@ -281,7 +345,35 @@ impl TailFile {
                 source,
             })?
             .len();
-        Ok(len < self.offset)
+        if len < self.offset || len < self.last_size {
+            self.last_size = len;
+            return Ok(true);
+        }
+        if self.offset > 0 && !self.fingerprint.is_empty() && len >= self.offset {
+            let fp_len = self.fingerprint.len() as u64;
+            let start = self.offset - fp_len;
+            let mut buf = vec![0u8; self.fingerprint.len()];
+            file.seek(SeekFrom::Start(start))
+                .map_err(|source| TailError::Io {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            file.read_exact(&mut buf).map_err(|source| TailError::Io {
+                path: self.path.clone(),
+                source,
+            })?;
+            file.seek(SeekFrom::Start(self.offset))
+                .map_err(|source| TailError::Io {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if buf != self.fingerprint {
+                self.last_size = len;
+                return Ok(true);
+            }
+        }
+        self.last_size = len;
+        Ok(false)
     }
 
     fn rewind(&mut self) -> Result<(), TailError> {
@@ -292,6 +384,7 @@ impl TailFile {
                 source,
             })?;
         self.offset = 0;
+        self.fingerprint.clear();
         self.decoder.reset();
         self.lines.clear();
         Ok(())
@@ -299,42 +392,87 @@ impl TailFile {
 
     /// `keep_last = Some(n)` retains only the last n complete lines.
     /// `keep_last = None` returns every complete line produced by this call.
+    ///
+    /// Format errors return the lines decoded so far alongside the error.
     fn consume(
         &mut self,
         keep_last: Option<usize>,
         flush: bool,
-    ) -> Result<Vec<Vec<u8>>, TailError> {
+    ) -> Result<(Vec<Vec<u8>>, Option<TailError>), TailError> {
         let mut ring = std::collections::VecDeque::new();
         let mut all = Vec::new();
         let mut decompressed = Vec::new();
+        let mut format_error = None;
+
+        // Snapshot the readable end so a racing writer cannot keep this call
+        // looping forever, and so memory for `all` stays proportional to one
+        // poll's budget rather than an unbounded append stream.
+        self.read_until = self.snapshot_end()?;
+
         loop {
             let chunk = self.read_chunk()?;
             if chunk.is_empty() {
                 if flush {
                     decompressed.clear();
-                    self.decoder.finish(&mut decompressed).map_err(|message| {
-                        TailError::Format {
-                            path: self.path.clone(),
-                            message,
+                    match self.decoder.finish(&mut decompressed) {
+                        Ok(()) => {
+                            self.take_lines(&decompressed, keep_last, &mut ring, &mut all);
                         }
-                    })?;
-                    self.take_lines(&decompressed, keep_last, &mut ring, &mut all);
+                        Err(message) => {
+                            self.take_lines(&decompressed, keep_last, &mut ring, &mut all);
+                            format_error = Some(TailError::Format {
+                                path: self.path.clone(),
+                                message,
+                            });
+                        }
+                    }
                 }
                 break;
             }
             decompressed.clear();
-            self.decoder
-                .feed(&chunk, &mut decompressed)
-                .map_err(|message| TailError::Format {
-                    path: self.path.clone(),
-                    message,
-                })?;
-            self.take_lines(&decompressed, keep_last, &mut ring, &mut all);
+            match self.decoder.feed(&chunk, &mut decompressed) {
+                Ok(()) => {
+                    self.take_lines(&decompressed, keep_last, &mut ring, &mut all);
+                }
+                Err(message) => {
+                    self.take_lines(&decompressed, keep_last, &mut ring, &mut all);
+                    format_error = Some(TailError::Format {
+                        path: self.path.clone(),
+                        message,
+                    });
+                    break;
+                }
+            }
         }
-        Ok(match keep_last {
+
+        self.read_until = None;
+        self.refresh_fingerprint()?;
+        if let Some(file) = &self.file {
+            if let Ok(meta) = file.metadata() {
+                self.last_size = meta.len();
+            }
+        }
+
+        let lines = match keep_last {
             Some(_) => ring.into_iter().collect(),
             None => all,
-        })
+        };
+        Ok((lines, format_error))
+    }
+
+    fn snapshot_end(&self) -> Result<Option<u64>, TailError> {
+        let Some(file) = &self.file else {
+            return Ok(None);
+        };
+        let len = file
+            .metadata()
+            .map_err(|source| TailError::Io {
+                path: self.path.clone(),
+                source,
+            })?
+            .len();
+        let end = len.min(self.offset.saturating_add(MAX_BYTES_PER_CONSUME));
+        Ok(Some(end))
     }
 
     fn take_lines(
@@ -359,6 +497,10 @@ impl TailFile {
         let Some(file) = self.file.as_mut() else {
             return Ok(Vec::new());
         };
+        let limit = self.read_until.unwrap_or(u64::MAX);
+        if self.offset >= limit {
+            return Ok(Vec::new());
+        }
         let len = file
             .metadata()
             .map_err(|source| TailError::Io {
@@ -367,11 +509,9 @@ impl TailFile {
             })?
             .len();
         if len < self.offset {
-            // Truncation is handled by the caller before the next consume.
-            // Stopping here avoids feeding a torn read into the inflater.
             return Ok(Vec::new());
         }
-        let available = (len - self.offset) as usize;
+        let available = (len.min(limit) - self.offset) as usize;
         if available == 0 {
             return Ok(Vec::new());
         }
@@ -395,6 +535,55 @@ impl TailFile {
         self.offset += filled as u64;
         Ok(buf)
     }
+
+    fn refresh_fingerprint(&mut self) -> Result<(), TailError> {
+        self.fingerprint.clear();
+        if self.offset == 0 {
+            return Ok(());
+        }
+        let Some(file) = self.file.as_mut() else {
+            return Ok(());
+        };
+        let len = FINGERPRINT as u64;
+        let start = self.offset.saturating_sub(len);
+        let want = (self.offset - start) as usize;
+        if want == 0 {
+            return Ok(());
+        }
+        let mut buf = vec![0u8; want];
+        file.seek(SeekFrom::Start(start))
+            .map_err(|source| TailError::Io {
+                path: self.path.clone(),
+                source,
+            })?;
+        file.read_exact(&mut buf).map_err(|source| TailError::Io {
+            path: self.path.clone(),
+            source,
+        })?;
+        file.seek(SeekFrom::Start(self.offset))
+            .map_err(|source| TailError::Io {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.fingerprint = buf;
+        Ok(())
+    }
+}
+
+fn require_regular(path: &Path, meta: &Metadata) -> Result<(), TailError> {
+    if meta.is_file() {
+        return Ok(());
+    }
+    if meta.is_dir() {
+        return Err(TailError::Format {
+            path: path.to_path_buf(),
+            message: "is a directory".into(),
+        });
+    }
+    Err(TailError::Format {
+        path: path.to_path_buf(),
+        message: "is not a regular file".into(),
+    })
 }
 
 fn file_id(meta: &Metadata) -> (u64, u64) {
@@ -408,6 +597,7 @@ mod tests {
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use std::io::Write;
+    use std::os::unix::net::UnixListener;
 
     fn gz(data: &[u8]) -> Vec<u8> {
         let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
@@ -436,6 +626,11 @@ mod tests {
         out
     }
 
+    fn deflate_len(member: &[u8]) -> u64 {
+        // Standard flate2 members: 10-byte header + 8-byte trailer.
+        member.len() as u64 - 18
+    }
+
     #[test]
     fn plain_last_n_fewer_than_n_and_no_short_file_exception() {
         let dir = tempfile::tempdir().unwrap();
@@ -449,8 +644,6 @@ mod tests {
             vec![b"a\n".to_vec(), b"b\n".to_vec(), b"c\n".to_vec()]
         );
 
-        // The Crystal version printed every line when the file had fewer than
-        // 20. Fifteen lines must yield the last 10, not all 15.
         let mut body = Vec::new();
         for i in 0..15 {
             writeln!(body, "L{i}").unwrap();
@@ -477,6 +670,7 @@ mod tests {
         let update = tail.poll().unwrap();
         assert_eq!(update.lines, vec![b"hello world\n".to_vec()]);
         assert!(update.notice.is_none());
+        assert!(update.error.is_none());
         append(&path, b" stuff\n");
         let update = tail.poll().unwrap();
         assert_eq!(update.lines, vec![b"more stuff\n".to_vec()]);
@@ -517,7 +711,6 @@ mod tests {
         let inflated = tail.inflate_bytes();
         assert_eq!(fed, first.len() as u64);
 
-        // A partial line split across two gzip members (`gzip >> file`).
         let second = gz(b"c");
         let third = gz(b"d\ne\n");
         append(&path, &second);
@@ -534,10 +727,10 @@ mod tests {
             "second poll re-fed the original member"
         );
         let inflate_delta = tail.inflate_bytes() - inflated;
-        assert!(inflate_delta > 0);
-        assert!(
-            inflate_delta < added as u64,
-            "framing should not be counted as inflate input"
+        let expected = deflate_len(&second) + deflate_len(&third);
+        assert_eq!(
+            inflate_delta, expected,
+            "inflate must count exactly the new DEFLATE payloads"
         );
     }
 
@@ -572,7 +765,7 @@ mod tests {
         assert_eq!(update.lines, vec![b"after\n".to_vec()]);
         assert_eq!(tail.bytes_fed(), compressed_len + extra.len() as u64);
         let delta = tail.inflate_bytes() - inflated;
-        assert!(delta > 0 && delta < extra.len() as u64);
+        assert_eq!(delta, deflate_len(&extra));
         assert!(
             delta * 20 < inflated,
             "append inflated {delta} bytes, original was {inflated}; file was re-read"
@@ -591,12 +784,28 @@ mod tests {
         let fed = tail.bytes_fed();
 
         let new = gz(b"new-1\n");
-        // Same inode: truncate in place, as logrotate copytruncate does.
         std::fs::write(&path, &new).unwrap();
         let update = tail.poll().unwrap();
         assert_eq!(update.notice, Some(Notice::Truncated));
         assert_eq!(update.lines, vec![b"new-1\n".to_vec()]);
         assert_eq!(tail.bytes_fed(), fed + new.len() as u64);
+    }
+
+    #[test]
+    fn truncate_and_regrow_to_same_size_is_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("regrow.log");
+        write(&path, b"AAAAAAAA\n");
+        let mut tail = TailFile::open(&path, false).unwrap();
+        assert_eq!(
+            tail.read_initial(10, false).unwrap(),
+            vec![b"AAAAAAAA\n".to_vec()]
+        );
+        // Same length, different content, same inode.
+        write(&path, b"BBBBBBBB\n");
+        let update = tail.poll().unwrap();
+        assert_eq!(update.notice, Some(Notice::Truncated));
+        assert_eq!(update.lines, vec![b"BBBBBBBB\n".to_vec()]);
     }
 
     #[test]
@@ -628,12 +837,33 @@ mod tests {
         assert_eq!(update.notice, Some(Notice::Replaced));
         assert_eq!(update.lines, vec![b"new-a\n".to_vec(), b"new-b\n".to_vec()]);
 
-        // Further appends to the new file are incremental.
         let fed = by_name.bytes_fed();
         append(&path, b"new-c\n");
         let update = by_name.poll().unwrap();
         assert_eq!(update.lines, vec![b"new-c\n".to_vec()]);
         assert_eq!(by_name.bytes_fed(), fed + 6);
+    }
+
+    #[test]
+    fn follow_name_drains_old_inode_before_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("drain.log");
+        write(&path, b"keep-me");
+        let mut tail = TailFile::open(&path, true).unwrap();
+        assert!(tail.read_initial(10, false).unwrap().is_empty());
+
+        // Append a complete line on the old inode, then rotate before poll.
+        append(&path, b"-old\n");
+        let rotated = dir.path().join("drain.log.1");
+        std::fs::rename(&path, &rotated).unwrap();
+        write(&path, b"new\n");
+
+        let update = tail.poll().unwrap();
+        assert_eq!(update.notice, Some(Notice::Replaced));
+        assert_eq!(
+            update.lines,
+            vec![b"keep-me-old\n".to_vec(), b"new\n".to_vec()]
+        );
     }
 
     #[test]
@@ -649,5 +879,60 @@ mod tests {
         let update = tail.poll().unwrap();
         assert_eq!(update.notice, Some(Notice::Appeared));
         assert_eq!(update.lines.len(), 3);
+    }
+
+    #[test]
+    fn truncated_gzip_without_follow_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cut.gz");
+        let compressed = gz(b"hello\nworld\n");
+        write(&path, &compressed[..compressed.len() / 2]);
+        let mut tail = TailFile::open(&path, false).unwrap();
+        let err = tail.read_initial(10, true).unwrap_err();
+        assert!(err.to_string().contains("truncated"), "{err}");
+    }
+
+    #[test]
+    fn valid_lines_before_format_error_are_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed.gz");
+        let mut blob = gz(b"good\n");
+        // Complete next header with an illegal compression method so feed()
+        // fails after the first member has already produced lines.
+        blob.extend_from_slice(&[0x1f, 0x8b, 0, 0, 0, 0, 0, 0, 0, 255]);
+        write(&path, &blob);
+        let mut tail = TailFile::open(&path, false).unwrap();
+        let (lines, error) = tail.consume(None, false).unwrap();
+        assert_eq!(lines, vec![b"good\n".to_vec()]);
+        assert!(error.is_some(), "expected format error after valid lines");
+    }
+
+    #[test]
+    fn fifo_is_rejected_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pipe");
+        nix_mkfifo(&path);
+        match TailFile::open(&path, false) {
+            Ok(_) => panic!("FIFO should be rejected"),
+            Err(err) => assert!(err.to_string().contains("not a regular file"), "{err}"),
+        }
+    }
+
+    #[test]
+    fn socket_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sock");
+        let _listener = UnixListener::bind(&path).unwrap();
+        match TailFile::open(&path, false) {
+            Ok(_) => panic!("socket should be rejected"),
+            Err(err) => assert!(err.to_string().contains("not a regular file"), "{err}"),
+        }
+    }
+
+    fn nix_mkfifo(path: &Path) {
+        use std::ffi::CString;
+        let c = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed");
     }
 }

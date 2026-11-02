@@ -74,6 +74,12 @@ impl GzipDecoder {
         self.inflate_bytes
     }
 
+    /// True when we are between members with no buffered input: a finished
+    /// stream, or a decoder that has not seen a header yet.
+    pub fn at_member_boundary(&self) -> bool {
+        matches!(self.state, State::FixedHeader) && self.pos >= self.buf.len()
+    }
+
     /// Accept the next slice of compressed bytes and append decompressed output.
     ///
     /// The whole slice is taken. Anything that cannot be parsed yet (a partial
@@ -452,14 +458,39 @@ mod tests {
         let bad_method = [0x1f, 0x8b, 0, 0, 0, 0, 0, 0, 0, 255];
         assert!(dec.feed(&bad_method, &mut out).is_err());
 
+        // Trailer layout: 4-byte CRC32, then 4-byte ISIZE. Corrupt the CRC.
         let mut compressed = gz(b"hello\n");
-        let last = compressed.len() - 1;
-        compressed[last] ^= 0xff;
+        let crc_byte = compressed.len() - 8;
+        compressed[crc_byte] ^= 0xff;
         let err = decode_all(&compressed).unwrap_err();
         assert!(
-            err.contains("mismatch"),
-            "expected trailer failure, got {err}"
+            err.contains("crc mismatch"),
+            "expected crc failure, got {err}"
         );
+
+        let mut isize_bad = gz(b"hello\n");
+        let last = isize_bad.len() - 1;
+        isize_bad[last] ^= 0xff;
+        let err = decode_all(&isize_bad).unwrap_err();
+        assert!(
+            err.contains("size mismatch"),
+            "expected isize failure, got {err}"
+        );
+    }
+
+    #[test]
+    fn at_member_boundary_after_complete_stream() {
+        let compressed = gz(b"hello\n");
+        let mut dec = GzipDecoder::new();
+        let mut out = Vec::new();
+        assert!(dec.at_member_boundary());
+        dec.feed(&compressed[..compressed.len() / 2], &mut out)
+            .unwrap();
+        assert!(!dec.at_member_boundary());
+        dec.feed(&compressed[compressed.len() / 2..], &mut out)
+            .unwrap();
+        assert!(dec.at_member_boundary());
+        assert_eq!(out, b"hello\n");
     }
 
     #[test]

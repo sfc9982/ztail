@@ -47,12 +47,14 @@ impl Stop {
 
 struct Headers {
     enabled: bool,
-    current: Option<PathBuf>,
+    /// Last operand slot that printed a header. Tracked by slot index so the
+    /// same path passed twice still gets a separator, like GNU tail.
+    current: Option<usize>,
 }
 
 impl Headers {
-    fn prefix(&mut self, path: &Path) -> Vec<u8> {
-        if !self.enabled || self.current.as_deref() == Some(path) {
+    fn prefix(&mut self, slot: usize, path: &Path) -> Vec<u8> {
+        if !self.enabled || self.current == Some(slot) {
             return Vec::new();
         }
         let mut buf = Vec::new();
@@ -60,7 +62,7 @@ impl Headers {
             buf.push(b'\n');
         }
         writeln!(buf, "==> {} <==", path.display()).expect("header fits in memory");
-        self.current = Some(path.to_path_buf());
+        self.current = Some(slot);
         buf
     }
 }
@@ -117,10 +119,11 @@ fn run_inner() -> Result<u8, Flow> {
     let mut failed = false;
 
     for path in &cli.files {
+        let slot_idx = slots.len();
         match TailFile::open(path, follow_name) {
             Ok(mut tail) => match tail.read_initial(n, flush) {
                 Ok(lines) => {
-                    write_stdout(&headers.prefix(tail.path()))?;
+                    write_stdout(&headers.prefix(slot_idx, tail.path()))?;
                     write_lines(&lines)?;
                     slots.push(Slot { tail, dead: false });
                 }
@@ -146,7 +149,7 @@ fn run_inner() -> Result<u8, Flow> {
     if !follow {
         return Ok(if failed { 1 } else { 0 });
     }
-    if slots.iter().all(|slot| slot.dead) {
+    if slots.is_empty() || slots.iter().all(|slot| slot.dead) {
         return Ok(1);
     }
 
@@ -155,6 +158,10 @@ fn run_inner() -> Result<u8, Flow> {
         warn("ztail: sleep interval is too large");
         Flow::Code(1)
     })?;
+    if interval.is_zero() {
+        warn("ztail: sleep interval is too small");
+        return Ok(1);
+    }
     let paths: Vec<PathBuf> = slots
         .iter()
         .map(|slot| slot.tail.path().to_path_buf())
@@ -166,7 +173,7 @@ fn run_inner() -> Result<u8, Flow> {
             return Ok(code);
         }
         let mut progressed = false;
-        for slot in slots.iter_mut() {
+        for (slot_idx, slot) in slots.iter_mut().enumerate() {
             if slot.dead {
                 continue;
             }
@@ -175,12 +182,16 @@ fn run_inner() -> Result<u8, Flow> {
                     if let Some(notice) = update.notice {
                         note(slot.tail.path(), notice);
                     }
-                    if update.lines.is_empty() {
-                        continue;
+                    if !update.lines.is_empty() {
+                        progressed = true;
+                        write_stdout(&headers.prefix(slot_idx, slot.tail.path()))?;
+                        write_lines(&update.lines)?;
                     }
-                    progressed = true;
-                    write_stdout(&headers.prefix(slot.tail.path()))?;
-                    write_lines(&update.lines)?;
+                    if let Some(err) = update.error {
+                        warn(&format!("ztail: {err}"));
+                        slot.dead = true;
+                        failed = true;
+                    }
                 }
                 Err(err) => {
                     warn(&format!("ztail: {err}"));

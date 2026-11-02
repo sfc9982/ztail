@@ -177,6 +177,45 @@ fn multiple_files_print_headers() {
 }
 
 #[test]
+fn repeated_path_operands_each_get_a_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.log");
+    std::fs::write(&a, b"alpha\n").unwrap();
+    let path = a.to_str().unwrap();
+    let output = Command::new(bin())
+        .args(["-v", path, path])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        text,
+        format!(
+            "==> {} <==\nalpha\n\n==> {} <==\nalpha\n",
+            a.display(),
+            a.display()
+        )
+    );
+}
+
+#[test]
+fn tiny_sleep_interval_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.log");
+    std::fs::write(&path, b"a\n").unwrap();
+    let output = Command::new(bin())
+        .args(["-f", "-s", "1e-12", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_ne!(output.status.code(), Some(0));
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("sleep interval") || err.contains("too small"),
+        "{err}"
+    );
+}
+
+#[test]
 fn quiet_suppresses_headers_and_one_missing_file_still_exits_1() {
     let dir = tempfile::tempdir().unwrap();
     let a = dir.path().join("a.log");

@@ -71,6 +71,12 @@ fn parse_sleep(raw: &str) -> Result<f64, String> {
     if !value.is_finite() || value <= 0.0 {
         return Err("sleep interval must be a positive number of seconds".into());
     }
+    // Values smaller than 1 ns round to a zero Duration and would busy-spin.
+    let duration = std::time::Duration::try_from_secs_f64(value)
+        .map_err(|_| "sleep interval is too large".to_string())?;
+    if duration.is_zero() {
+        return Err("sleep interval is too small (rounds to zero)".into());
+    }
     Ok(value)
 }
 

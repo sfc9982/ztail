@@ -11,6 +11,8 @@ use crate::gzip::GzipDecoder;
 const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b];
 const ZSTD_MAGIC: &[u8] = &[0x28, 0xb5, 0x2f, 0xfd];
 const XZ_MAGIC: &[u8] = &[0xfd, b'7', b'z', b'X', b'Z', 0x00];
+#[cfg(feature = "zstd")]
+const OUT_CHUNK: usize = 64 * 1024;
 
 enum Kind {
     /// Not enough bytes to distinguish a magic prefix from plain text.
@@ -133,19 +135,33 @@ impl Decoder {
         }
     }
 
-    /// End of a non-following read. A leftover magic prefix is plain text:
-    /// the file ended before it could become a real compressed stream.
+    /// End of a non-following read.
+    ///
+    /// A leftover magic prefix is plain text: the file ended before it could
+    /// become a real compressed stream. An incomplete gzip member or zstd
+    /// frame is an error so truncated archives are not reported as success.
     pub fn finish(&mut self, out: &mut Vec<u8>) -> Result<(), String> {
-        let Kind::Sniff(buf) = &self.kind else {
-            return Ok(());
-        };
-        if buf.is_empty() {
-            return Ok(());
+        match &mut self.kind {
+            Kind::Sniff(buf) => {
+                if buf.is_empty() {
+                    return Ok(());
+                }
+                let buffered = take_sniff(&mut self.kind);
+                self.kind = Kind::Plain;
+                out.extend_from_slice(&buffered);
+                Ok(())
+            }
+            Kind::Plain => Ok(()),
+            Kind::Gzip(dec) => {
+                if dec.at_member_boundary() {
+                    Ok(())
+                } else {
+                    Err("truncated gzip stream (incomplete member)".into())
+                }
+            }
+            #[cfg(feature = "zstd")]
+            Kind::Zstd(dec) => dec.finish(out),
         }
-        let buffered = take_sniff(&mut self.kind);
-        self.kind = Kind::Plain;
-        out.extend_from_slice(&buffered);
-        Ok(())
     }
 
     fn push_decoded(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
@@ -223,6 +239,8 @@ struct ZstdDec {
     fed: u64,
     buf: Vec<u8>,
     pos: usize,
+    /// True after we have accepted frame bytes and before `remaining == 0`.
+    in_frame: bool,
 }
 
 #[cfg(feature = "zstd")]
@@ -234,6 +252,7 @@ impl ZstdDec {
             fed: 0,
             buf: Vec::new(),
             pos: 0,
+            in_frame: false,
         })
     }
 
@@ -246,24 +265,52 @@ impl ZstdDec {
         result
     }
 
+    fn finish(&mut self, out: &mut Vec<u8>) -> Result<(), String> {
+        self.pump(out)?;
+        self.park();
+        if self.pos < self.buf.len() || self.in_frame {
+            return Err("truncated zstd stream (incomplete frame)".into());
+        }
+        Ok(())
+    }
+
     fn pump(&mut self, out: &mut Vec<u8>) -> Result<(), String> {
         use zstd::stream::raw::Operation;
 
         loop {
-            if self.pos >= self.buf.len() {
-                return Ok(());
-            }
+            let input = if self.pos < self.buf.len() {
+                &self.buf[self.pos..]
+            } else {
+                &[][..]
+            };
             let start = out.len();
-            out.resize(start + 64 * 1024, 0);
+            out.resize(start + OUT_CHUNK, 0);
             let status = self
                 .dec
-                .run_on_buffers(&self.buf[self.pos..], &mut out[start..])
+                .run_on_buffers(input, &mut out[start..])
                 .map_err(|e| format!("zstd: {e}"))?;
             out.truncate(start + status.bytes_written);
             self.pos += status.bytes_read;
             self.fed += status.bytes_read as u64;
+            if status.bytes_read > 0 || status.bytes_written > 0 {
+                self.in_frame = true;
+            }
+            if status.remaining == 0 && (status.bytes_read > 0 || status.bytes_written > 0) {
+                // End of a frame. More frames may follow in the buffer.
+                self.in_frame = false;
+            }
+            if status.bytes_written == OUT_CHUNK {
+                // Output buffer was full; decoder may still have pending bytes
+                // even with no remaining input.
+                continue;
+            }
+            if self.pos >= self.buf.len() {
+                // No more input. Stop unless we just filled the output buffer
+                // (handled above). Pending incomplete frames stay in `in_frame`.
+                return Ok(());
+            }
             if status.bytes_read == 0 && status.bytes_written == 0 {
-                // Need more input. The unread tail stays in `buf`.
+                // Need more input to continue the current frame.
                 return Ok(());
             }
         }
@@ -285,6 +332,15 @@ impl ZstdDec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    fn gz(data: &[u8]) -> Vec<u8> {
+        let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
 
     #[test]
     fn plain_text_and_magic_prefix() {
@@ -306,6 +362,27 @@ mod tests {
         dec.feed(&[0x1f], &mut out).unwrap();
         dec.finish(&mut out).unwrap();
         assert_eq!(out, [0x1f]);
+    }
+
+    #[test]
+    fn finish_rejects_truncated_gzip() {
+        let compressed = gz(b"hello\nworld\n");
+        let cut = compressed.len() / 2;
+        let mut dec = Decoder::new();
+        let mut out = Vec::new();
+        dec.feed(&compressed[..cut], &mut out).unwrap();
+        let err = dec.finish(&mut out).unwrap_err();
+        assert!(err.contains("truncated"), "{err}");
+    }
+
+    #[test]
+    fn finish_accepts_complete_gzip() {
+        let compressed = gz(b"hello\n");
+        let mut dec = Decoder::new();
+        let mut out = Vec::new();
+        dec.feed(&compressed, &mut out).unwrap();
+        dec.finish(&mut out).unwrap();
+        assert_eq!(out, b"hello\n");
     }
 
     #[test]
@@ -339,8 +416,37 @@ mod tests {
         let mid = frame_a.len() / 2;
         dec.feed(&blob[..mid], &mut out).unwrap();
         dec.feed(&blob[mid..], &mut out).unwrap();
+        dec.finish(&mut out).unwrap();
         assert_eq!(out, b"alpha\nbeta\n");
         assert_eq!(dec.bytes_fed(), blob.len() as u64);
         assert!(dec.inflate_bytes() > 0);
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn zstd_drains_large_output_from_one_feed() {
+        // Highly compressible payload: one feed can fill multiple 64 KiB
+        // output buffers from a short compressed frame.
+        let payload = vec![b'a'; 200_000];
+        let frame = zstd::encode_all(&payload[..], 1).unwrap();
+        assert!(frame.len() < 64 * 1024);
+
+        let mut dec = Decoder::new();
+        let mut out = Vec::new();
+        dec.feed(&frame, &mut out).unwrap();
+        dec.finish(&mut out).unwrap();
+        assert_eq!(out.len(), payload.len());
+        assert!(out.iter().all(|&b| b == b'a'));
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn finish_rejects_truncated_zstd() {
+        let frame = zstd::encode_all(&b"hello world\n"[..], 1).unwrap();
+        let mut dec = Decoder::new();
+        let mut out = Vec::new();
+        dec.feed(&frame[..frame.len() / 2], &mut out).unwrap();
+        let err = dec.finish(&mut out).unwrap_err();
+        assert!(err.contains("truncated"), "{err}");
     }
 }
