@@ -1,0 +1,36 @@
+[package]
+name = "ztail"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Tail gzip, zstd, and plain text files without re-decompressing"
+readme = "README.md"
+repository = "https://github.com/sfc9982/ztail"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+crc32fast = "1.4"
+# Pure-Rust inflate. `zlib-rs` is the flate2 backend; the low-level
+# `Decompress` type keeps a persistent streaming state across polls.
+flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
+notify = "6.1"
+signal-hook = "0.3"
+
+[dependencies.zstd]
+version = "0.13"
+optional = true
+
+[features]
+default = []
+# Streaming zstd via the `zstd` crate (bundles libzstd). Off by default so the
+# static musl build stays pure Rust.
+zstd = ["dep:zstd"]
+
+[dev-dependencies]
+libc = "0.2"
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
