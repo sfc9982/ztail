@@ -14,3 +14,4 @@ mod tailfile;
 mod watch;
 
 pub use app::run;
+pub use tailfile::TailFile;
