@@ -27,8 +27,13 @@ default = []
 zstd = ["dep:zstd"]
 
 [dev-dependencies]
+criterion = "0.5"
 libc = "0.2"
 tempfile = "3"
+
+[[bench]]
+name = "scan"
+harness = false
 
 [profile.release]
 lto = true

@@ -237,8 +237,9 @@ fn is_proper_prefix(buf: &[u8], magic: &[u8]) -> bool {
 struct ZstdDec {
     dec: zstd::stream::raw::Decoder<'static>,
     fed: u64,
+    /// Unconsumed tail from a previous feed. Empty on the fast path so the
+    /// next chunk is decoded in place.
     buf: Vec<u8>,
-    pos: usize,
     /// True after we have accepted frame bytes and before `remaining == 0`.
     in_frame: bool,
 }
@@ -251,37 +252,55 @@ impl ZstdDec {
             dec,
             fed: 0,
             buf: Vec::new(),
-            pos: 0,
             in_frame: false,
         })
     }
 
     fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
-        if !input.is_empty() {
-            self.buf.extend_from_slice(input);
+        if self.buf.is_empty() {
+            if input.is_empty() {
+                return Ok(());
+            }
+            let mut pos = 0;
+            let result = self.pump(input, &mut pos, out);
+            if pos < input.len() {
+                self.buf.extend_from_slice(&input[pos..]);
+            }
+            return result;
         }
-        let result = self.pump(out);
-        self.park();
+        self.buf.extend_from_slice(input);
+        let data = std::mem::take(&mut self.buf);
+        let mut pos = 0;
+        let result = self.pump(&data, &mut pos, out);
+        if pos < data.len() {
+            self.buf.extend_from_slice(&data[pos..]);
+        }
         result
     }
 
     fn finish(&mut self, out: &mut Vec<u8>) -> Result<(), String> {
-        self.pump(out)?;
-        self.park();
-        if self.pos < self.buf.len() || self.in_frame {
+        if !self.buf.is_empty() {
+            let data = std::mem::take(&mut self.buf);
+            let mut pos = 0;
+            self.pump(&data, &mut pos, out)?;
+            if pos < data.len() {
+                self.buf.extend_from_slice(&data[pos..]);
+            }
+        }
+        if !self.buf.is_empty() || self.in_frame {
             return Err("truncated zstd stream (incomplete frame)".into());
         }
         Ok(())
     }
 
-    fn pump(&mut self, out: &mut Vec<u8>) -> Result<(), String> {
+    fn pump(&mut self, data: &[u8], pos: &mut usize, out: &mut Vec<u8>) -> Result<(), String> {
         use zstd::stream::raw::Operation;
 
         loop {
-            let input = if self.pos < self.buf.len() {
-                &self.buf[self.pos..]
+            let input = if *pos < data.len() {
+                &data[*pos..]
             } else {
-                &[][..]
+                &[]
             };
             let start = out.len();
             out.resize(start + OUT_CHUNK, 0);
@@ -290,7 +309,7 @@ impl ZstdDec {
                 .run_on_buffers(input, &mut out[start..])
                 .map_err(|e| format!("zstd: {e}"))?;
             out.truncate(start + status.bytes_written);
-            self.pos += status.bytes_read;
+            *pos += status.bytes_read;
             self.fed += status.bytes_read as u64;
             if status.bytes_read > 0 || status.bytes_written > 0 {
                 self.in_frame = true;
@@ -304,7 +323,7 @@ impl ZstdDec {
                 // even with no remaining input.
                 continue;
             }
-            if self.pos >= self.buf.len() {
+            if *pos >= data.len() {
                 // No more input. Stop unless we just filled the output buffer
                 // (handled above). Pending incomplete frames stay in `in_frame`.
                 return Ok(());
@@ -314,18 +333,6 @@ impl ZstdDec {
                 return Ok(());
             }
         }
-    }
-
-    fn park(&mut self) {
-        if self.pos == 0 {
-            return;
-        }
-        if self.pos >= self.buf.len() {
-            self.buf.clear();
-        } else {
-            self.buf.drain(..self.pos);
-        }
-        self.pos = 0;
     }
 }
 

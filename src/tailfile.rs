@@ -16,11 +16,12 @@
 use std::fs::{File, Metadata};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::decode::Decoder;
 use crate::lines::{retain_last, LineBuffer};
 
-const CHUNK: usize = 64 * 1024;
+const CHUNK: usize = 256 * 1024;
 /// Cap how much one poll/consume will read so follow stays responsive.
 const MAX_BYTES_PER_CONSUME: u64 = 8 * 1024 * 1024;
 /// Bytes kept just behind the cursor to detect truncate-and-regrow.
@@ -102,8 +103,19 @@ pub struct TailFile {
     offset: u64,
     /// Last observed size of the open file; used with the fingerprint.
     last_size: u64,
+    /// Size and mtime observed when `fingerprint` was last known valid.
+    /// Idle polls with the same pair skip the fingerprint seek/read.
+    fp_len: u64,
+    fp_mtime: Option<SystemTime>,
+    /// File offset when `fingerprint` was read. Unchanged offset skips a refresh.
+    fp_offset: u64,
     /// Content just behind `offset`, used to catch truncate-and-regrow.
     fingerprint: Vec<u8>,
+    /// Reused across `read_chunk` calls.
+    read_buf: Vec<u8>,
+    /// Length and mtime from the current consume snapshot.
+    snap_len: u64,
+    snap_mtime: Option<SystemTime>,
     dev: u64,
     ino: u64,
     decoder: Decoder,
@@ -141,7 +153,13 @@ impl TailFile {
             file: Some(file),
             offset: 0,
             last_size: meta.len(),
+            fp_len: 0,
+            fp_mtime: None,
+            fp_offset: 0,
             fingerprint: Vec::new(),
+            read_buf: Vec::new(),
+            snap_len: meta.len(),
+            snap_mtime: meta.modified().ok(),
             dev,
             ino,
             decoder: Decoder::new(),
@@ -161,7 +179,13 @@ impl TailFile {
             file: None,
             offset: 0,
             last_size: 0,
+            fp_len: 0,
+            fp_mtime: None,
+            fp_offset: 0,
             fingerprint: Vec::new(),
+            read_buf: Vec::new(),
+            snap_len: 0,
+            snap_mtime: None,
             dev: 0,
             ino: 0,
             decoder: Decoder::new(),
@@ -327,6 +351,9 @@ impl TailFile {
         self.ino = ino;
         self.offset = 0;
         self.last_size = meta.len();
+        self.fp_len = 0;
+        self.fp_mtime = None;
+        self.fp_offset = 0;
         self.fingerprint.clear();
         self.decoder.reset();
         self.lines.clear();
@@ -338,18 +365,18 @@ impl TailFile {
         let Some(file) = &mut self.file else {
             return Ok(false);
         };
-        let len = file
-            .metadata()
-            .map_err(|source| TailError::Io {
-                path: self.path.clone(),
-                source,
-            })?
-            .len();
+        let meta = file.metadata().map_err(|source| TailError::Io {
+            path: self.path.clone(),
+            source,
+        })?;
+        let len = meta.len();
+        let mtime = meta.modified().ok();
         if len < self.offset || len < self.last_size {
             self.last_size = len;
             return Ok(true);
         }
-        if self.offset > 0 && !self.fingerprint.is_empty() && len >= self.offset {
+        let unchanged = mtime.is_some() && len == self.fp_len && mtime == self.fp_mtime;
+        if !unchanged && self.offset > 0 && !self.fingerprint.is_empty() && len >= self.offset {
             let fp_len = self.fingerprint.len() as u64;
             let start = self.offset - fp_len;
             let mut buf = vec![0u8; self.fingerprint.len()];
@@ -384,6 +411,9 @@ impl TailFile {
                 source,
             })?;
         self.offset = 0;
+        self.fp_offset = 0;
+        self.fp_len = 0;
+        self.fp_mtime = None;
         self.fingerprint.clear();
         self.decoder.reset();
         self.lines.clear();
@@ -410,8 +440,8 @@ impl TailFile {
         self.read_until = self.snapshot_end()?;
 
         loop {
-            let chunk = self.read_chunk()?;
-            if chunk.is_empty() {
+            let n = self.read_chunk()?;
+            if n == 0 {
                 if flush {
                     decompressed.clear();
                     match self.decoder.finish(&mut decompressed) {
@@ -430,7 +460,10 @@ impl TailFile {
                 break;
             }
             decompressed.clear();
-            match self.decoder.feed(&chunk, &mut decompressed) {
+            let chunk = std::mem::take(&mut self.read_buf);
+            let fed = self.decoder.feed(&chunk[..n], &mut decompressed);
+            self.read_buf = chunk;
+            match fed {
                 Ok(()) => {
                     self.take_lines(&decompressed, keep_last, &mut ring, &mut all);
                 }
@@ -446,12 +479,13 @@ impl TailFile {
         }
 
         self.read_until = None;
-        self.refresh_fingerprint()?;
-        if let Some(file) = &self.file {
-            if let Ok(meta) = file.metadata() {
-                self.last_size = meta.len();
-            }
+        if self.offset != self.fp_offset {
+            self.refresh_fingerprint()?;
+            self.fp_offset = self.offset;
         }
+        self.last_size = self.snap_len;
+        self.fp_len = self.snap_len;
+        self.fp_mtime = self.snap_mtime;
 
         let lines = match keep_last {
             Some(_) => ring.into_iter().collect(),
@@ -460,17 +494,17 @@ impl TailFile {
         Ok((lines, format_error))
     }
 
-    fn snapshot_end(&self) -> Result<Option<u64>, TailError> {
+    fn snapshot_end(&mut self) -> Result<Option<u64>, TailError> {
         let Some(file) = &self.file else {
             return Ok(None);
         };
-        let len = file
-            .metadata()
-            .map_err(|source| TailError::Io {
-                path: self.path.clone(),
-                source,
-            })?
-            .len();
+        let meta = file.metadata().map_err(|source| TailError::Io {
+            path: self.path.clone(),
+            source,
+        })?;
+        let len = meta.len();
+        self.snap_len = len;
+        self.snap_mtime = meta.modified().ok();
         let end = len.min(self.offset.saturating_add(MAX_BYTES_PER_CONSUME));
         Ok(Some(end))
     }
@@ -485,41 +519,35 @@ impl TailFile {
         if data.is_empty() {
             return;
         }
-        for line in self.lines.push(data) {
-            match keep_last {
-                Some(n) => retain_last(ring, n, line),
-                None => all.push(line),
+        self.lines.push_with(data, |line| match keep_last {
+            Some(n) => retain_last(ring, n, line),
+            None => {
+                all.push(line);
+                None
             }
-        }
+        });
     }
 
-    fn read_chunk(&mut self) -> Result<Vec<u8>, TailError> {
+    /// Fill `read_buf` up to the snapshot limit. `Ok(0)` means nothing left.
+    fn read_chunk(&mut self) -> Result<usize, TailError> {
         let Some(file) = self.file.as_mut() else {
-            return Ok(Vec::new());
+            return Ok(0);
         };
         let limit = self.read_until.unwrap_or(u64::MAX);
         if self.offset >= limit {
-            return Ok(Vec::new());
+            return Ok(0);
         }
-        let len = file
-            .metadata()
-            .map_err(|source| TailError::Io {
-                path: self.path.clone(),
-                source,
-            })?
-            .len();
-        if len < self.offset {
-            return Ok(Vec::new());
-        }
-        let available = (len.min(limit) - self.offset) as usize;
+        let available = (limit - self.offset) as usize;
         if available == 0 {
-            return Ok(Vec::new());
+            return Ok(0);
         }
         let want = available.min(CHUNK);
-        let mut buf = vec![0u8; want];
+        if self.read_buf.len() < want {
+            self.read_buf.resize(want, 0);
+        }
         let mut filled = 0;
         while filled < want {
-            match file.read(&mut buf[filled..]) {
+            match file.read(&mut self.read_buf[filled..want]) {
                 Ok(0) => break,
                 Ok(n) => filled += n,
                 Err(source) if source.kind() == io::ErrorKind::Interrupted => continue,
@@ -531,9 +559,8 @@ impl TailFile {
                 }
             }
         }
-        buf.truncate(filled);
         self.offset += filled as u64;
-        Ok(buf)
+        Ok(filled)
     }
 
     fn refresh_fingerprint(&mut self) -> Result<(), TailError> {
@@ -801,8 +828,14 @@ mod tests {
             tail.read_initial(10, false).unwrap(),
             vec![b"AAAAAAAA\n".to_vec()]
         );
-        // Same length, different content, same inode.
+        // Same length, different content, same inode. Detection keys off
+        // mtime, and some filesystems coalesce back-to-back updates, so
+        // move the timestamp forward explicitly.
         write(&path, b"BBBBBBBB\n");
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        let bumped =
+            file.metadata().unwrap().modified().unwrap() + std::time::Duration::from_secs(1);
+        file.set_modified(bumped).unwrap();
         let update = tail.poll().unwrap();
         assert_eq!(update.notice, Some(Notice::Truncated));
         assert_eq!(update.lines, vec![b"BBBBBBBB\n".to_vec()]);
