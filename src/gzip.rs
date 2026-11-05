@@ -49,9 +49,10 @@ pub struct GzipDecoder {
     uncomp_len: u32,
     /// Compressed bytes actually handed to [`Decompress`], excluding gzip framing.
     inflate_bytes: u64,
-    /// Unconsumed input. `pos` is the first byte not yet parsed.
+    /// Unconsumed tail from a previous feed (partial header, trailer, or
+    /// deflate symbol). Empty on the fast path so the next chunk is inflated
+    /// in place.
     buf: Vec<u8>,
-    pos: usize,
 }
 
 impl GzipDecoder {
@@ -66,7 +67,6 @@ impl GzipDecoder {
             uncomp_len: 0,
             inflate_bytes: 0,
             buf: Vec::new(),
-            pos: 0,
         }
     }
 
@@ -77,37 +77,41 @@ impl GzipDecoder {
     /// True when we are between members with no buffered input: a finished
     /// stream, or a decoder that has not seen a header yet.
     pub fn at_member_boundary(&self) -> bool {
-        matches!(self.state, State::FixedHeader) && self.pos >= self.buf.len()
+        matches!(self.state, State::FixedHeader) && self.buf.is_empty()
     }
 
     /// Accept the next slice of compressed bytes and append decompressed output.
     ///
-    /// The whole slice is taken. Anything that cannot be parsed yet (a partial
-    /// header, a partial trailer, or a partial DEFLATE symbol) stays here.
+    /// The whole slice is taken. A short unconsumed tail (partial header,
+    /// trailer, or DEFLATE symbol) is parked; the rest is inflated in place.
     pub fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
-        if !input.is_empty() {
-            self.buf.extend_from_slice(input);
+        if self.buf.is_empty() {
+            if input.is_empty() {
+                return Ok(());
+            }
+            let mut pos = 0;
+            let result = self.pump(input, &mut pos, out);
+            if pos < input.len() {
+                self.buf.extend_from_slice(&input[pos..]);
+            }
+            return result;
         }
-        let result = self.pump(out);
-        self.park();
+        // Rare path: a previous feed left a fragment that must be contiguous
+        // with the new bytes. The fragment is small; the new chunk is copied
+        // once onto it.
+        self.buf.extend_from_slice(input);
+        let data = std::mem::take(&mut self.buf);
+        let mut pos = 0;
+        let result = self.pump(&data, &mut pos, out);
+        if pos < data.len() {
+            self.buf.extend_from_slice(&data[pos..]);
+        }
         result
     }
 
-    fn park(&mut self) {
-        if self.pos == 0 {
-            return;
-        }
-        if self.pos >= self.buf.len() {
-            self.buf.clear();
-        } else {
-            self.buf.drain(..self.pos);
-        }
-        self.pos = 0;
-    }
-
-    fn pump(&mut self, out: &mut Vec<u8>) -> Result<(), String> {
+    fn pump(&mut self, data: &[u8], pos: &mut usize, out: &mut Vec<u8>) -> Result<(), String> {
         loop {
-            let available = self.buf.len().saturating_sub(self.pos);
+            let available = data.len().saturating_sub(*pos);
             if available == 0 {
                 return Ok(());
             }
@@ -116,16 +120,16 @@ impl GzipDecoder {
                     if available < HEADER_LEN {
                         return Ok(());
                     }
-                    self.parse_fixed_header()?;
-                    self.pos += HEADER_LEN;
+                    self.parse_fixed_header(data, *pos)?;
+                    *pos += HEADER_LEN;
                 }
                 State::ExtraLen => {
                     if available < 2 {
                         return Ok(());
                     }
-                    let b = &self.buf[self.pos..self.pos + 2];
+                    let b = &data[*pos..*pos + 2];
                     self.extra_remaining = u16::from_le_bytes([b[0], b[1]]) as usize;
-                    self.pos += 2;
+                    *pos += 2;
                     self.state = if self.extra_remaining == 0 {
                         self.after_extra()
                     } else {
@@ -134,7 +138,7 @@ impl GzipDecoder {
                 }
                 State::Extra => {
                     let skip = self.extra_remaining.min(available);
-                    self.pos += skip;
+                    *pos += skip;
                     self.extra_remaining -= skip;
                     if self.extra_remaining == 0 {
                         self.state = self.after_extra();
@@ -143,13 +147,13 @@ impl GzipDecoder {
                     }
                 }
                 State::Name => {
-                    if !self.skip_cstring()? {
+                    if !self.skip_cstring(data, pos)? {
                         return Ok(());
                     }
                     self.state = self.after_name();
                 }
                 State::Comment => {
-                    if !self.skip_cstring()? {
+                    if !self.skip_cstring(data, pos)? {
                         return Ok(());
                     }
                     self.state = self.after_comment();
@@ -160,12 +164,12 @@ impl GzipDecoder {
                     if available < 2 {
                         return Ok(());
                     }
-                    self.pos += 2;
+                    *pos += 2;
                     self.state = State::Body;
                 }
                 State::Body => {
-                    let (consumed, status) = self.inflate_some(out)?;
-                    self.pos += consumed;
+                    let (consumed, status) = self.inflate_some(data, *pos, out)?;
+                    *pos += consumed;
                     if status == Status::StreamEnd {
                         self.state = State::Trailer;
                         continue;
@@ -181,16 +185,16 @@ impl GzipDecoder {
                     if available < TRAILER_LEN {
                         return Ok(());
                     }
-                    self.check_trailer()?;
-                    self.pos += TRAILER_LEN;
+                    self.check_trailer(data, *pos)?;
+                    *pos += TRAILER_LEN;
                     self.finish_member();
                 }
             }
         }
     }
 
-    fn parse_fixed_header(&mut self) -> Result<(), String> {
-        let h = &self.buf[self.pos..self.pos + HEADER_LEN];
+    fn parse_fixed_header(&mut self, data: &[u8], pos: usize) -> Result<(), String> {
+        let h = &data[pos..pos + HEADER_LEN];
         if h[0] != 0x1f || h[1] != 0x8b {
             return Err("invalid gzip magic".into());
         }
@@ -242,22 +246,27 @@ impl GzipDecoder {
         }
     }
 
-    /// Skip a NUL-terminated string. Returns false if the NUL is not buffered yet.
-    fn skip_cstring(&mut self) -> Result<bool, String> {
-        let rest = &self.buf[self.pos..];
+    /// Skip a NUL-terminated string. Returns false if the NUL is not in `data` yet.
+    fn skip_cstring(&mut self, data: &[u8], pos: &mut usize) -> Result<bool, String> {
+        let rest = &data[*pos..];
         if let Some(i) = rest.iter().position(|&b| b == 0) {
-            self.pos += i + 1;
+            *pos += i + 1;
             Ok(true)
         } else {
             // The bytes seen so far cannot contain the terminator. Drop them
             // so a long filename does not have to sit in memory.
-            self.pos = self.buf.len();
+            *pos = data.len();
             Ok(false)
         }
     }
 
-    fn inflate_some(&mut self, out: &mut Vec<u8>) -> Result<(usize, Status), String> {
-        let input_len = self.buf.len() - self.pos;
+    fn inflate_some(
+        &mut self,
+        data: &[u8],
+        base: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<(usize, Status), String> {
+        let input_len = data.len() - base;
         let mut consumed = 0;
         let mut status;
         loop {
@@ -268,7 +277,7 @@ impl GzipDecoder {
             status = self
                 .inflate
                 .decompress(
-                    &self.buf[self.pos + consumed..],
+                    &data[base + consumed..],
                     &mut out[start..],
                     FlushDecompress::None,
                 )
@@ -303,8 +312,8 @@ impl GzipDecoder {
         Ok((consumed, status))
     }
 
-    fn check_trailer(&mut self) -> Result<(), String> {
-        let t = &self.buf[self.pos..self.pos + TRAILER_LEN];
+    fn check_trailer(&mut self, data: &[u8], pos: usize) -> Result<(), String> {
+        let t = &data[pos..pos + TRAILER_LEN];
         let expect_crc = u32::from_le_bytes(t[0..4].try_into().unwrap());
         let expect_size = u32::from_le_bytes(t[4..8].try_into().unwrap());
         let got_crc = self.crc.clone().finalize();

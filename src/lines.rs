@@ -29,13 +29,27 @@ impl LineBuffer {
     /// A trailing fragment with no newline stays buffered, unless it exceeds
     /// [`MAX_PARTIAL_LINE`], in which case it is force-emitted without a
     /// newline so memory stays bounded.
+    #[cfg(test)]
     pub fn push(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
         let mut lines = Vec::new();
+        self.push_with(data, |line| {
+            lines.push(line);
+            None
+        });
+        lines
+    }
+
+    /// Like [`push`](Self::push), but `on_line` may return a buffer to reuse
+    /// for the next line. The initial last-N scan returns the evicted ring
+    /// entry so a long file allocates about N line buffers.
+    pub fn push_with(&mut self, data: &[u8], mut on_line: impl FnMut(Vec<u8>) -> Option<Vec<u8>>) {
+        let mut spare: Option<Vec<u8>> = None;
         let mut start = 0;
         for (i, &byte) in data.iter().enumerate() {
             if byte == b'\n' {
                 self.partial.extend_from_slice(&data[start..=i]);
-                lines.push(std::mem::take(&mut self.partial));
+                let line = take_line(&mut self.partial, &mut spare);
+                spare = on_line(line);
                 start = i + 1;
             }
         }
@@ -43,10 +57,17 @@ impl LineBuffer {
             self.partial.extend_from_slice(&data[start..]);
             while self.partial.len() > MAX_PARTIAL_LINE {
                 let rest = self.partial.split_off(MAX_PARTIAL_LINE);
-                lines.push(std::mem::replace(&mut self.partial, rest));
+                let line = if let Some(mut slot) = spare.take() {
+                    slot.clear();
+                    slot.extend_from_slice(&self.partial);
+                    self.partial = rest;
+                    slot
+                } else {
+                    std::mem::replace(&mut self.partial, rest)
+                };
+                spare = on_line(line);
             }
         }
-        lines
     }
 
     pub fn clear(&mut self) {
@@ -63,14 +84,33 @@ impl LineBuffer {
 ///
 /// `n == 0` drops every line. This is the initial view: one forward pass, no
 /// second read, and no "print everything when the file is short" special case.
-pub fn retain_last(ring: &mut std::collections::VecDeque<Vec<u8>>, n: usize, line: Vec<u8>) {
+/// Returns the evicted buffer so the caller can reuse its allocation.
+pub fn retain_last(
+    ring: &mut std::collections::VecDeque<Vec<u8>>,
+    n: usize,
+    line: Vec<u8>,
+) -> Option<Vec<u8>> {
     if n == 0 {
-        return;
+        return Some(line);
     }
     if ring.len() == n {
-        ring.pop_front();
+        let old = ring.pop_front();
+        ring.push_back(line);
+        return old;
     }
     ring.push_back(line);
+    None
+}
+
+fn take_line(partial: &mut Vec<u8>, spare: &mut Option<Vec<u8>>) -> Vec<u8> {
+    if let Some(mut slot) = spare.take() {
+        slot.clear();
+        slot.extend_from_slice(partial);
+        partial.clear();
+        slot
+    } else {
+        std::mem::take(partial)
+    }
 }
 
 #[cfg(test)]
