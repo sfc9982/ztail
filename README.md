@@ -73,7 +73,13 @@ cargo test
 cargo test --all-features   # includes the zstd decoder
 ```
 
-Unit tests cover single-member and multi-member gzip (including one-byte splits and a payload larger than the inflate output buffer), partial lines, truncation, rotation vs follow-by-descriptor, last-N when the file has fewer lines than N, and a large file whose second poll feeds only the appended member. Integration tests cover headers, exit codes, SIGPIPE, follow, and SIGINT.
+Unit tests cover single-member and multi-member gzip (including one-byte splits and a payload larger than the inflate output buffer), partial lines, truncation, rotation vs follow-by-descriptor, last-N when the file has fewer lines than N, and a large file whose second poll feeds only the appended member. Property tests exercise arbitrary chunk boundaries in line splitting, gzip/zstd decoding, and the public `TailFile` append path. Integration tests cover headers, exit codes, SIGPIPE, follow, rotation, truncation, and SIGINT.
+
+Coverage needs `cargo-llvm-cov` and the `llvm-tools-preview` component:
+
+```bash
+cargo llvm-cov --all-features --lcov --output-path lcov.info
+```
 
 ## Legacy
 

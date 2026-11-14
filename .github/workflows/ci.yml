@@ -2,7 +2,17 @@ name: CI
 
 on:
   push:
+    branches: [main]
+    tags: ["v*"]
   pull_request:
+
+concurrency:
+  group: "ci-${{ github.ref }}"
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
 
 jobs:
   test:
@@ -13,6 +23,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy (default features)
@@ -23,6 +34,45 @@ jobs:
         run: cargo test --all-targets
       - name: Test with zstd
         run: cargo test --all-targets --all-features
+      - name: Doctests
+        run: cargo test --doc --all-features
+      - name: Docs
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --no-deps --all-features
+
+  msrv:
+    name: MSRV 1.85
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      # proptest is pinned to ~1.11 because 1.12 needs Rust 1.88. If another
+      # dev-dependency ever raises its MSRV, narrow this to `--lib --bins`
+      # (dropping `--all-targets`) rather than deleting the job.
+      - name: Check
+        run: cargo check --locked --all-targets --all-features
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Generate lcov report
+        run: cargo llvm-cov --all-features --lcov --output-path lcov.info
+      - name: Print coverage summary
+        run: cargo llvm-cov report --summary-only
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: error
 
   musl:
     name: static musl release
@@ -32,6 +82,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
       - name: Install musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Release build
@@ -53,3 +104,10 @@ jobs:
           fi
           printf '%s\n' "$ldd_out" | grep -Eq 'statically linked|not a dynamic executable'
           "$bin" --version
+      - name: Upload static binary
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ztail-x86_64-linux-musl
+          path: target/x86_64-unknown-linux-musl/release/ztail
+          if-no-files-found: error

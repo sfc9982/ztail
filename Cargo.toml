@@ -29,6 +29,8 @@ zstd = ["dep:zstd"]
 [dev-dependencies]
 criterion = "0.5"
 libc = "0.2"
+# proptest 1.12 requires Rust 1.88; ~1.11 keeps the MSRV (1.85) job on 1.85.
+proptest = "~1.11"
 tempfile = "3"
 
 [[bench]]

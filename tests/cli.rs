@@ -1,7 +1,7 @@
 //! Black-box tests for the `ztail` binary: exit codes, headers, follow, signals.
 
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -40,7 +40,15 @@ impl Drop for ChildGuard {
 }
 
 fn set_nonblocking(child: &mut Child) {
-    let fd = child.stdout.as_ref().unwrap().as_raw_fd();
+    if let Some(stdout) = child.stdout.as_ref() {
+        set_fd_nonblocking(stdout.as_raw_fd());
+    }
+    if let Some(stderr) = child.stderr.as_ref() {
+        set_fd_nonblocking(stderr.as_raw_fd());
+    }
+}
+
+fn set_fd_nonblocking(fd: RawFd) {
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
         assert!(flags >= 0, "F_GETFL failed");
@@ -68,6 +76,71 @@ fn read_for(child: &mut Child, timeout: Duration) -> Vec<u8> {
         }
     }
     got
+}
+
+fn wait_for(child: &mut Child, timeout: Duration, mut done: impl FnMut(&[u8]) -> bool) -> Vec<u8> {
+    read_until(
+        child.stdout.as_mut().expect("stdout is piped"),
+        timeout,
+        &mut done,
+    )
+}
+
+fn wait_for_stderr(
+    child: &mut Child,
+    timeout: Duration,
+    mut done: impl FnMut(&[u8]) -> bool,
+) -> Vec<u8> {
+    read_until(
+        child.stderr.as_mut().expect("stderr is piped"),
+        timeout,
+        &mut done,
+    )
+}
+
+fn read_until(
+    stream: &mut impl Read,
+    timeout: Duration,
+    done: &mut impl FnMut(&[u8]) -> bool,
+) -> Vec<u8> {
+    let start = Instant::now();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    while start.elapsed() < timeout {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                got.extend_from_slice(&buf[..n]);
+                if done(&got) {
+                    break;
+                }
+            }
+            Err(err)
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(err) => panic!("read stream: {err}"),
+        }
+    }
+    got
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn interrupt(child: &mut ChildGuard) -> std::process::ExitStatus {
+    let pid = child.inner().id() as i32;
+    unsafe {
+        assert_eq!(libc::kill(pid, libc::SIGINT), 0);
+    }
+    let status = child.inner().wait().unwrap();
+    child.0.take();
+    status
 }
 
 #[test]
@@ -339,4 +412,290 @@ fn help_mentions_follow_is_opt_in() {
         "{text}"
     );
     assert!(text.contains("-f") || text.contains("--follow"), "{text}");
+}
+
+#[test]
+fn zero_lines_prints_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("zero.log");
+    std::fs::write(&path, b"a\nb\n").unwrap();
+    let output = Command::new(bin())
+        .args(["-n", "0", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+}
+
+#[test]
+fn invalid_line_count_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.log");
+    std::fs::write(&path, b"a\n").unwrap();
+    let output = Command::new(bin())
+        .args(["-n", "not-a-number", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("invalid value"), "{err}");
+    assert!(err.contains("not-a-number"), "{err}");
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn verbose_prints_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("one.log");
+    std::fs::write(&path, b"only\n").unwrap();
+    let output = Command::new(bin())
+        .args(["-v", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.starts_with(&format!("==> {} <==\n", path.display())),
+        "{text}"
+    );
+    assert!(text.ends_with("only\n"), "{text}");
+}
+
+#[test]
+fn corrupt_gzip_exits_nonzero() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("corrupt.gz");
+    let mut blob = gz(b"good\n");
+    // A complete second header with an illegal compression method: the first
+    // member decodes, then the format error stops the initial read.
+    blob.extend_from_slice(&[0x1f, 0x8b, 0, 0, 0, 0, 0, 0, 0, 255]);
+    std::fs::write(&path, &blob).unwrap();
+
+    let output = Command::new(bin())
+        .arg(path.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        contains(&output.stderr, b"unsupported gzip compression method"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // `read_initial` drops lines decoded before a format error; this pins the
+    // current behavior (the unit-level consume() keeps them).
+    assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+}
+
+#[test]
+fn follow_gzip_new_member() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("live.gz");
+    std::fs::write(&path, gz(b"one\ntwo\n")).unwrap();
+
+    let mut child = ChildGuard::new(
+        Command::new(bin())
+            .args(["-f", "-s", "0.2", "-n", "10", path.to_str().unwrap()])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    set_nonblocking(child.inner());
+    let initial = wait_for(child.inner(), Duration::from_secs(2), |out| {
+        out.ends_with(b"one\ntwo\n")
+    });
+    assert!(
+        contains(&initial, b"one\ntwo\n"),
+        "{}",
+        String::from_utf8_lossy(&initial)
+    );
+
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(&gz(b"three\nfour\n"))
+        .unwrap();
+    let more = wait_for(child.inner(), Duration::from_secs(3), |out| {
+        out.ends_with(b"three\nfour\n")
+    });
+    assert!(
+        contains(&more, b"three\nfour\n"),
+        "follow did not see the new gzip member: {}",
+        String::from_utf8_lossy(&more)
+    );
+
+    let status = interrupt(&mut child);
+    assert_eq!(status.code(), Some(130));
+}
+
+#[test]
+fn follow_truncation_rewinds() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("trunc.log");
+    std::fs::write(&path, b"old-1\nold-2\n").unwrap();
+
+    let mut child = ChildGuard::new(
+        Command::new(bin())
+            .args(["-f", "-s", "0.2", "-n", "10", path.to_str().unwrap()])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    set_nonblocking(child.inner());
+    let initial = wait_for(child.inner(), Duration::from_secs(2), |out| {
+        out.ends_with(b"old-2\n")
+    });
+    assert!(
+        contains(&initial, b"old-1\nold-2\n"),
+        "{}",
+        String::from_utf8_lossy(&initial)
+    );
+
+    std::fs::write(&path, b"new-1\n").unwrap();
+    let more = wait_for(child.inner(), Duration::from_secs(3), |out| {
+        out.ends_with(b"new-1\n")
+    });
+    assert!(
+        contains(&more, b"new-1\n"),
+        "truncation did not restart the decoder: {}",
+        String::from_utf8_lossy(&more)
+    );
+    let err = wait_for_stderr(child.inner(), Duration::from_secs(2), |err| {
+        contains(err, b"file truncated")
+    });
+    assert!(
+        contains(&err, b"file truncated"),
+        "{}",
+        String::from_utf8_lossy(&err)
+    );
+
+    let status = interrupt(&mut child);
+    assert_eq!(status.code(), Some(130));
+}
+
+#[test]
+fn follow_name_survives_rotation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rotate.log");
+    std::fs::write(&path, b"old\n").unwrap();
+
+    let mut child = ChildGuard::new(
+        Command::new(bin())
+            .args(["-F", "-s", "0.2", "-n", "10", path.to_str().unwrap()])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    set_nonblocking(child.inner());
+    let initial = wait_for(child.inner(), Duration::from_secs(2), |out| {
+        out.ends_with(b"old\n")
+    });
+    assert!(
+        contains(&initial, b"old\n"),
+        "{}",
+        String::from_utf8_lossy(&initial)
+    );
+
+    let rotated = dir.path().join("rotate.log.1");
+    std::fs::rename(&path, &rotated).unwrap();
+    std::fs::write(&path, b"new-a\nnew-b\n").unwrap();
+
+    let more = wait_for(child.inner(), Duration::from_secs(3), |out| {
+        out.ends_with(b"new-a\nnew-b\n")
+    });
+    assert!(
+        contains(&more, b"new-a\nnew-b\n"),
+        "rotation was not followed: {}",
+        String::from_utf8_lossy(&more)
+    );
+    assert!(
+        child.inner().try_wait().unwrap().is_none(),
+        "ztail exited after rotation"
+    );
+
+    let status = interrupt(&mut child);
+    assert_eq!(status.code(), Some(130));
+}
+
+#[test]
+fn follow_name_waits_for_appearance() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("later.log");
+
+    let mut child = ChildGuard::new(
+        Command::new(bin())
+            .args(["-F", "-s", "0.2", path.to_str().unwrap()])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    set_nonblocking(child.inner());
+    let err = wait_for_stderr(child.inner(), Duration::from_secs(2), |err| {
+        contains(err, b"waiting for it to appear")
+    });
+    assert!(
+        contains(&err, b"waiting for it to appear"),
+        "{}",
+        String::from_utf8_lossy(&err)
+    );
+    assert!(
+        child.inner().try_wait().unwrap().is_none(),
+        "ztail exited while waiting for the path"
+    );
+
+    std::fs::write(&path, b"one\ntwo\n").unwrap();
+    let output = wait_for(child.inner(), Duration::from_secs(3), |out| {
+        out.ends_with(b"one\ntwo\n")
+    });
+    assert!(
+        contains(&output, b"one\ntwo\n"),
+        "the file that appeared was not read: {}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(
+        child.inner().try_wait().unwrap().is_none(),
+        "ztail exited after the file appeared"
+    );
+
+    let status = interrupt(&mut child);
+    assert_eq!(status.code(), Some(130));
+}
+
+#[cfg(feature = "zstd")]
+#[test]
+fn zstd_file_decodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.log.zst");
+    let frame = zstd::encode_all(&b"z0\nz1\nz2\n"[..], 1).unwrap();
+    std::fs::write(&path, frame).unwrap();
+
+    let output = Command::new(bin())
+        .args(["-n", "2", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"z1\nz2\n");
+}
+
+#[cfg(not(feature = "zstd"))]
+#[test]
+fn zstd_file_without_feature_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.log.zst");
+    std::fs::write(&path, [0x28, 0xb5, 0x2f, 0xfd]).unwrap();
+
+    let output = Command::new(bin())
+        .arg(path.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        contains(&output.stderr, b"without zstd support"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

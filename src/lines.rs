@@ -116,6 +116,7 @@ fn take_line(partial: &mut Vec<u8>, spare: &mut Option<Vec<u8>>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::collections::VecDeque;
 
     #[test]
@@ -188,5 +189,76 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].len(), MAX_PARTIAL_LINE);
         assert_eq!(buf.partial().len(), 10);
+    }
+
+    fn expected_split(data: &[u8]) -> (Vec<Vec<u8>>, Vec<u8>) {
+        let mut lines: Vec<Vec<u8>> = data
+            .split_inclusive(|&byte| byte == b'\n')
+            .map(<[u8]>::to_vec)
+            .collect();
+        let partial = match lines.last() {
+            Some(last) if last.last() != Some(&b'\n') => lines.pop().unwrap(),
+            _ => Vec::new(),
+        };
+        (lines, partial)
+    }
+
+    fn split_points(raw: Vec<usize>, len: usize) -> Vec<usize> {
+        let mut points: Vec<usize> = raw.into_iter().filter(|&point| point <= len).collect();
+        points.sort_unstable();
+        points.dedup();
+        points
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_chunks_match_newline_split(
+            data in prop::collection::vec(any::<u8>(), 0..512),
+            raw_splits in prop::collection::vec(0usize..=512, 0..16),
+        ) {
+            let points = split_points(raw_splits, data.len());
+            let mut buf = LineBuffer::new();
+            let mut got = Vec::new();
+            let mut start = 0;
+            for end in points.into_iter().chain(std::iter::once(data.len())) {
+                if end <= start {
+                    continue;
+                }
+                got.extend(buf.push(&data[start..end]));
+                start = end;
+            }
+
+            let (lines, partial) = expected_split(&data);
+            prop_assert_eq!(&got, &lines);
+            prop_assert_eq!(buf.partial(), partial.as_slice());
+        }
+
+        #[test]
+        fn retain_last_keeps_exact_tail(
+            data in prop::collection::vec(any::<u8>(), 0..512),
+            n in 0usize..32,
+            raw_splits in prop::collection::vec(0usize..=512, 0..16),
+        ) {
+            let (lines, _) = expected_split(&data);
+            let keep = lines.len().saturating_sub(n);
+            let expected = lines[keep..].to_vec();
+
+            let points = split_points(raw_splits, data.len());
+            let mut ring = VecDeque::new();
+            let mut buf = LineBuffer::new();
+            let mut start = 0;
+            for end in points.into_iter().chain(std::iter::once(data.len())) {
+                if end <= start {
+                    continue;
+                }
+                buf.push_with(&data[start..end], |line| {
+                    retain_last(&mut ring, n, line)
+                });
+                start = end;
+            }
+
+            let kept: Vec<Vec<u8>> = ring.into_iter().collect();
+            prop_assert_eq!(kept, expected);
+        }
     }
 }

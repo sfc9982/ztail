@@ -341,6 +341,7 @@ mod tests {
     use super::*;
     use flate2::write::GzEncoder;
     use flate2::Compression;
+    use proptest::prelude::*;
     use std::io::Write;
 
     fn gz(data: &[u8]) -> Vec<u8> {
@@ -455,5 +456,73 @@ mod tests {
         dec.feed(&frame[..frame.len() / 2], &mut out).unwrap();
         let err = dec.finish(&mut out).unwrap_err();
         assert!(err.contains("truncated"), "{err}");
+    }
+
+    fn force_plain(mut data: Vec<u8>) -> Vec<u8> {
+        if !matches!(detect(&data), Detected::Plain) {
+            data.insert(0, b'x');
+        }
+        data
+    }
+
+    fn feed_chunks(dec: &mut Decoder, data: &[u8], raw_splits: Vec<usize>) -> Vec<u8> {
+        let mut points: Vec<usize> = raw_splits
+            .into_iter()
+            .filter(|&point| point <= data.len())
+            .collect();
+        points.sort_unstable();
+        points.dedup();
+
+        let mut out = Vec::new();
+        let mut start = 0;
+        for end in points.into_iter().chain(std::iter::once(data.len())) {
+            if end <= start {
+                continue;
+            }
+            dec.feed(&data[start..end], &mut out).unwrap();
+            start = end;
+        }
+        dec.finish(&mut out).unwrap();
+        out
+    }
+
+    proptest! {
+        #[test]
+        fn plain_bytes_survive_arbitrary_splits(
+            data in prop::collection::vec(any::<u8>(), 0..512),
+            raw_splits in prop::collection::vec(0usize..=512, 0..16),
+        ) {
+            let data = force_plain(data);
+            let mut dec = Decoder::new();
+            let out = feed_chunks(&mut dec, &data, raw_splits);
+            prop_assert_eq!(&out, &data);
+        }
+
+        #[test]
+        fn gzip_bytes_survive_arbitrary_splits(
+            payload in prop::collection::vec(any::<u8>(), 0..512),
+            raw_splits in prop::collection::vec(0usize..=2048, 0..16),
+        ) {
+            let blob = gz(&payload);
+            let mut dec = Decoder::new();
+            let out = feed_chunks(&mut dec, &blob, raw_splits);
+            prop_assert_eq!(&out, &payload);
+            prop_assert_eq!(dec.bytes_fed(), blob.len() as u64);
+        }
+    }
+
+    #[cfg(feature = "zstd")]
+    proptest! {
+        #[test]
+        fn zstd_bytes_survive_arbitrary_splits(
+            payload in prop::collection::vec(any::<u8>(), 0..512),
+            raw_splits in prop::collection::vec(0usize..=2048, 0..16),
+        ) {
+            let blob = zstd::encode_all(&payload[..], 1).unwrap();
+            let mut dec = Decoder::new();
+            let out = feed_chunks(&mut dec, &blob, raw_splits);
+            prop_assert_eq!(&out, &payload);
+            prop_assert_eq!(dec.bytes_fed(), blob.len() as u64);
+        }
     }
 }

@@ -353,6 +353,7 @@ mod tests {
     use flate2::read::MultiGzDecoder;
     use flate2::write::GzEncoder;
     use flate2::{Compression, GzBuilder};
+    use proptest::prelude::*;
     use std::io::{Read, Write};
 
     fn gz(data: &[u8]) -> Vec<u8> {
@@ -524,5 +525,44 @@ mod tests {
         // 10 byte header + 8 byte trailer are not inflate input.
         assert!(dec.inflate_bytes() + 18 <= compressed.len() as u64);
         assert!(dec.inflate_bytes() > 0);
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_members_and_splits(
+            payloads in prop::collection::vec(
+                prop::collection::vec(any::<u8>(), 0..256),
+                1..=3,
+            ),
+            raw_splits in prop::collection::vec(0usize..=2048, 0..24),
+        ) {
+            let mut blob = Vec::new();
+            let mut expected = Vec::new();
+            for payload in &payloads {
+                blob.extend_from_slice(&gz(payload));
+                expected.extend_from_slice(payload);
+            }
+
+            let mut points: Vec<usize> = raw_splits
+                .into_iter()
+                .filter(|&point| point <= blob.len())
+                .collect();
+            points.sort_unstable();
+            points.dedup();
+
+            let mut dec = GzipDecoder::new();
+            let mut out = Vec::new();
+            let mut start = 0;
+            for end in points.into_iter().chain(std::iter::once(blob.len())) {
+                if end <= start {
+                    continue;
+                }
+                dec.feed(&blob[start..end], &mut out).unwrap();
+                start = end;
+            }
+
+            prop_assert_eq!(&out, &expected);
+            prop_assert!(dec.at_member_boundary());
+        }
     }
 }
