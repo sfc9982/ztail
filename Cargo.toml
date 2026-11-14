@@ -22,7 +22,7 @@ memchr = "2"
 # `Decompress` type keeps a persistent streaming state across polls.
 flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
 notify = "6.1"
-signal-hook = "0.3"
+signal-hook = "0.4"
 
 [dependencies.zstd]
 version = "0.13"
