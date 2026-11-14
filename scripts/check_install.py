@@ -16,25 +16,25 @@ def main():
     args = parser.parse_args()
     if os.name != "posix":
         parser.error("run this Linux installation check inside Linux/WSL")
-    scratch = ROOT / "target"
-    scratch.mkdir(exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="ztail-install-", dir=scratch) as temporary:
+    # Use the Linux-native temporary filesystem: WSL mounted Windows drives may
+    # not preserve Unix permission bits. TemporaryDirectory owns only this tree.
+    scratch = Path(tempfile.gettempdir()).resolve()
+    with tempfile.TemporaryDirectory(prefix="ztail-install-") as temporary:
         stage = Path(temporary).resolve()
-        assert stage.parent == scratch.resolve()
+        assert stage.parent == scratch and stage.name.startswith("ztail-install-")
         sentinel = stage / "usr/share/ztail/unrelated.txt"
         sentinel.parent.mkdir(parents=True)
         sentinel.write_text("preserve unrelated files", encoding="utf-8")
         command = ["make", "PREFIX=/usr", f"DESTDIR={stage}", "BINDIR=/usr/bin",
                    "DATADIR=/usr/share", "MANDIR=/usr/share/man"]
-        if args.all_features:
-            command.append("CARGO_FEATURES=--all-features")
+        command.append("CARGO_FEATURES=--all-features" if args.all_features else "CARGO_FEATURES=")
         subprocess.run(command + ["install"], cwd=ROOT, check=True)
         expected = ["usr/bin/ztail", "usr/share/man/man1/ztail.1",
                     "usr/share/bash-completion/completions/ztail",
                     "usr/share/zsh/site-functions/_ztail",
                     "usr/share/fish/vendor_completions.d/ztail.fish",
-                    "usr/share/ztail/completions/elvish",
-                    "usr/share/ztail/completions/powershell",
+                    "usr/share/ztail/completions/ztail.elv",
+                    "usr/share/ztail/completions/ztail.ps1",
                     "usr/share/ztail/BUILD-INFO.json"]
         for relative in expected:
             path = stage / relative

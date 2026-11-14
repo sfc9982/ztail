@@ -1,4 +1,4 @@
-# Linux source installation. No sudo, downloads, or publication are performed.
+# Linux source installation. No sudo or publication; Cargo may fetch locked dependencies.
 PREFIX ?= $(HOME)/.local
 DESTDIR ?=
 BINDIR ?= $(PREFIX)/bin
@@ -28,9 +28,8 @@ install: assets
 	install -Dm644 "$(ASSET_DIR)/bash" "$(DESTDIR)$(DATADIR)/bash-completion/completions/ztail"
 	install -Dm644 "$(ASSET_DIR)/zsh" "$(DESTDIR)$(DATADIR)/zsh/site-functions/_ztail"
 	install -Dm644 "$(ASSET_DIR)/fish" "$(DESTDIR)$(DATADIR)/fish/vendor_completions.d/ztail.fish"
-	@set -eu; for shell in elvish powershell; do \
-	  install -Dm644 "$(ASSET_DIR)/$$shell" "$(DESTDIR)$(DATADIR)/ztail/completions/$$shell"; \
-	done
+	install -Dm644 "$(ASSET_DIR)/elvish" "$(DESTDIR)$(DATADIR)/ztail/completions/ztail.elv"
+	install -Dm644 "$(ASSET_DIR)/powershell" "$(DESTDIR)$(DATADIR)/ztail/completions/ztail.ps1"
 	install -Dm644 "$(ASSET_DIR)/BUILD-INFO.json" "$(DESTDIR)$(DATADIR)/ztail/BUILD-INFO.json"
 
 # Remove only the files owned by this install target, never entire directories.
@@ -39,6 +38,6 @@ uninstall:
 	  "$(DESTDIR)$(DATADIR)/bash-completion/completions/ztail" \
 	  "$(DESTDIR)$(DATADIR)/zsh/site-functions/_ztail" \
 	  "$(DESTDIR)$(DATADIR)/fish/vendor_completions.d/ztail.fish" \
-	  "$(DESTDIR)$(DATADIR)/ztail/completions/elvish" \
-	  "$(DESTDIR)$(DATADIR)/ztail/completions/powershell" \
+	  "$(DESTDIR)$(DATADIR)/ztail/completions/ztail.elv" \
+	  "$(DESTDIR)$(DATADIR)/ztail/completions/ztail.ps1" \
 	  "$(DESTDIR)$(DATADIR)/ztail/BUILD-INFO.json"

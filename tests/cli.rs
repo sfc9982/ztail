@@ -1067,7 +1067,8 @@ fn manpage_uses_cli_options_and_is_reproducible_without_colors() {
         assert!(!output.stdout.contains(&0x1b));
         let page = String::from_utf8(output.stdout.clone())
             .unwrap()
-            .replace("\\-", "-");
+            .replace("\\-", "-")
+            .replace("\\:", "");
         assert!(page.contains(".TH ZTAIL"), "{page}");
         for flag in [
             "--completions",

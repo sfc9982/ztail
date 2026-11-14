@@ -17,7 +17,9 @@ No upstream implementation or license text was copied into ztail.
 1. `--manpage` generates an offline roff manual from the same clap definition as
    help and completion scripts. Additional sections document exit status,
    environment variables, file types, and safety boundaries. No build date enters
-   generated output. Releases now include man/ztail.1.
+   generated output. Chinese manuals include invisible Han-character breakpoints
+   for roff renderers rather than treating long Chinese sentences as Latin words.
+   Releases now include man/ztail.1.
 2. `--build-info` emits schema-versioned JSON with version, Cargo target triple,
    and enabled formats. It contains no usernames, source paths, timestamps, or
    private environment data. Existing `--version` output stays compatible.
@@ -41,3 +43,20 @@ No upstream implementation or license text was copied into ztail.
   require CI, signal/filesystem-event tests, and runnable release verification.
 - No self-update, automatic crates.io publication, or invented license/maintainer
   contact details. Licensing and final publication authorization remain explicit.
+
+
+## Build-info JSON contract
+
+Example for a minimal Linux glibc build:
+
+```json
+{"schema_version":1,"name":"ztail","version":"0.1.0","target":"x86_64-unknown-linux-gnu","features":["gzip","plain"]}
+```
+
+Consumers should parse JSON, not rely on whitespace, key order, or array order.
+The features array describes available input formats, not every Cargo dependency
+or compiler option. A zstd-enabled build also contains "zstd". Unknown additional
+object fields may be ignored; incompatible changes to existing fields require a
+new schema_version. All fields are build-derived, independent of locale/color,
+and no input file is needed. This is diagnostic metadata, not an attestation that
+an arbitrary executable is trustworthy or that it will run on every libc version.

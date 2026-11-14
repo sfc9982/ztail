@@ -14,7 +14,34 @@ pub fn render(language: Language) -> Vec<u8> {
         .render(&mut page)
         .expect("manual fits in memory");
     page.extend_from_slice(language.text(EXTRA_EN, EXTRA_ZH).as_bytes());
+    if matches!(language, Language::Chinese) {
+        // Roff does not infer word boundaries between Han characters. Supply
+        // invisible break opportunities and disable Latin-style justification.
+        return cjk_layout(std::str::from_utf8(&page).expect("manual is UTF-8")).into_bytes();
+    }
     page
+}
+
+fn cjk_layout(input: &str) -> String {
+    let han = |ch: char| matches!(ch, '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}');
+    let mut output = String::with_capacity(input.len());
+    for line in input.split_inclusive('\n') {
+        let mut chars = line.chars().peekable();
+        while let Some(ch) = chars.next() {
+            output.push(ch);
+            if han(ch) && chars.peek().is_some_and(|&next| han(next)) {
+                output.push_str(r"\:");
+            }
+        }
+        // man macros can restore adjustment, so reset after each such macro.
+        if [".TH ", ".SH ", ".SS ", ".PP", ".TP"]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+        {
+            output.push_str(".na\n");
+        }
+    }
+    output
 }
 
 const EXTRA_EN: &str = r#"

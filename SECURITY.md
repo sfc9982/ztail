@@ -44,5 +44,6 @@ A read-only GitHub Actions workflow runs cargo-audit on dependency changes and
 weekly against RustSec's advisory database. Dependabot proposes Cargo and action
 updates; merging remains manual and requires MSRV/default/zstd tests. Workflow
 actions are pinned to full commit SHAs. Findings must be assessed: absence of
-known advisories is not proof of safety. The audit does not replace fuzzing,
+known advisories is not proof of safety. This job checks RustSec advisories, not
+registry yanking status. The audit does not replace fuzzing,
 parser tests, dependency license review, or review of newly introduced unsafe code.
