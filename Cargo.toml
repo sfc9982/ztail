@@ -7,9 +7,17 @@ description = "Tail gzip, zstd, and plain text files without re-decompressing"
 readme = "README.md"
 repository = "https://github.com/sfc9982/ztail"
 
+keywords = ["tail", "gzip", "logs", "cli", "zstd"]
+categories = ["command-line-utilities", "compression"]
+include = ["src/**", "tests/**", "benches/*.rs", "benches/*.py", "docs/*.md", "scripts/*.py", "README.md", "CHANGELOG.md", "Cargo.toml", "Cargo.lock", "LICENSE*", "build.rs", "Makefile", "CONTRIBUTING.md", "SECURITY.md"]
+
 [dependencies]
+clap_complete = "~4.5.67"
+clap_mangen = "~0.3.3"
 clap = { version = "4.5", features = ["derive"] }
 crc32fast = "1.4"
+libc = "0.2"
+memchr = "2"
 # Pure-Rust inflate. `zlib-rs` is the flate2 backend; the low-level
 # `Decompress` type keeps a persistent streaming state across polls.
 flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
@@ -28,7 +36,7 @@ zstd = ["dep:zstd"]
 
 [dev-dependencies]
 criterion = "0.5"
-libc = "0.2"
+serde_json = "1"
 # proptest 1.12 requires Rust 1.88; ~1.11 keeps the MSRV (1.85) job on 1.85.
 proptest = "~1.11"
 tempfile = "3"

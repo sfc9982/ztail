@@ -46,6 +46,7 @@ pub struct GzipDecoder {
     flags: u8,
     extra_remaining: usize,
     crc: Hasher,
+    header_crc: Hasher,
     uncomp_len: u32,
     /// Compressed bytes actually handed to [`Decompress`], excluding gzip framing.
     inflate_bytes: u64,
@@ -53,6 +54,8 @@ pub struct GzipDecoder {
     /// deflate symbol). Empty on the fast path so the next chunk is inflated
     /// in place.
     buf: Vec<u8>,
+    buf_pos: usize,
+    needs_drain: bool,
 }
 
 impl GzipDecoder {
@@ -64,9 +67,12 @@ impl GzipDecoder {
             flags: 0,
             extra_remaining: 0,
             crc: Hasher::new(),
+            header_crc: Hasher::new(),
             uncomp_len: 0,
             inflate_bytes: 0,
             buf: Vec::new(),
+            buf_pos: 0,
+            needs_drain: false,
         }
     }
 
@@ -84,35 +90,59 @@ impl GzipDecoder {
     ///
     /// The whole slice is taken. A short unconsumed tail (partial header,
     /// trailer, or DEFLATE symbol) is parked; the rest is inflated in place.
+    #[cfg(test)]
     pub fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
-        if self.buf.is_empty() {
-            if input.is_empty() {
-                return Ok(());
-            }
+        self.feed_limited(input, out, usize::MAX)
+    }
+
+    pub fn needs_drain(&self) -> bool {
+        self.needs_drain
+    }
+
+    /// Pause after at most `limit` output bytes, retaining both compressed
+    /// input and inflater state. Draining does not repeatedly copy the tail.
+    pub fn feed_limited(
+        &mut self,
+        input: &[u8],
+        out: &mut Vec<u8>,
+        limit: usize,
+    ) -> Result<(), String> {
+        let result = if self.buf.is_empty() && !input.is_empty() {
             let mut pos = 0;
-            let result = self.pump(input, &mut pos, out);
-            if pos < input.len() {
-                self.buf.extend_from_slice(&input[pos..]);
+            let result = self.pump(input, &mut pos, out, limit);
+            self.buf.extend_from_slice(&input[pos..]);
+            result
+        } else {
+            if !input.is_empty() {
+                self.buf.drain(..self.buf_pos);
+                self.buf_pos = 0;
+                self.buf.extend_from_slice(input);
             }
-            return result;
-        }
-        // Rare path: a previous feed left a fragment that must be contiguous
-        // with the new bytes. The fragment is small; the new chunk is copied
-        // once onto it.
-        self.buf.extend_from_slice(input);
-        let data = std::mem::take(&mut self.buf);
-        let mut pos = 0;
-        let result = self.pump(&data, &mut pos, out);
-        if pos < data.len() {
-            self.buf.extend_from_slice(&data[pos..]);
-        }
+            let mut data = std::mem::take(&mut self.buf);
+            let mut pos = self.buf_pos;
+            let result = self.pump(&data, &mut pos, out, limit);
+            if pos == data.len() {
+                data.clear();
+                pos = 0;
+            }
+            self.buf = data;
+            self.buf_pos = pos;
+            result
+        };
+        self.needs_drain = out.len() >= limit;
         result
     }
 
-    fn pump(&mut self, data: &[u8], pos: &mut usize, out: &mut Vec<u8>) -> Result<(), String> {
+    fn pump(
+        &mut self,
+        data: &[u8],
+        pos: &mut usize,
+        out: &mut Vec<u8>,
+        limit: usize,
+    ) -> Result<(), String> {
         loop {
             let available = data.len().saturating_sub(*pos);
-            if available == 0 {
+            if out.len() >= limit || (available == 0 && !matches!(self.state, State::Body)) {
                 return Ok(());
             }
             match self.state {
@@ -129,6 +159,7 @@ impl GzipDecoder {
                     }
                     let b = &data[*pos..*pos + 2];
                     self.extra_remaining = u16::from_le_bytes([b[0], b[1]]) as usize;
+                    self.header_crc.update(b);
                     *pos += 2;
                     self.state = if self.extra_remaining == 0 {
                         self.after_extra()
@@ -138,6 +169,7 @@ impl GzipDecoder {
                 }
                 State::Extra => {
                     let skip = self.extra_remaining.min(available);
+                    self.header_crc.update(&data[*pos..*pos + skip]);
                     *pos += skip;
                     self.extra_remaining -= skip;
                     if self.extra_remaining == 0 {
@@ -159,16 +191,19 @@ impl GzipDecoder {
                     self.state = self.after_comment();
                 }
                 State::Hcrc => {
-                    // Header CRC is optional and rarely written. We consume it
-                    // so it is not fed to the inflater; we do not validate it.
+                    // RFC 1952: FHCRC is the low 16 bits of the header CRC32.
                     if available < 2 {
                         return Ok(());
+                    }
+                    let expected = u16::from_le_bytes([data[*pos], data[*pos + 1]]);
+                    if expected != self.header_crc.clone().finalize() as u16 {
+                        return Err("gzip header crc mismatch".into());
                     }
                     *pos += 2;
                     self.state = State::Body;
                 }
                 State::Body => {
-                    let (consumed, status) = self.inflate_some(data, *pos, out)?;
+                    let (consumed, status) = self.inflate_some(data, *pos, out, limit)?;
                     *pos += consumed;
                     if status == Status::StreamEnd {
                         self.state = State::Trailer;
@@ -209,6 +244,8 @@ impl GzipDecoder {
         }
         // Bit 0 (FTEXT) is a hint for the decompressed data and does not
         // change parsing. Bits we do honor: FEXTRA, FNAME, FCOMMENT, FHCRC.
+        self.header_crc = Hasher::new();
+        self.header_crc.update(h);
         self.flags = h[3];
         self.state = self.after_fixed();
         Ok(())
@@ -249,12 +286,14 @@ impl GzipDecoder {
     /// Skip a NUL-terminated string. Returns false if the NUL is not in `data` yet.
     fn skip_cstring(&mut self, data: &[u8], pos: &mut usize) -> Result<bool, String> {
         let rest = &data[*pos..];
-        if let Some(i) = rest.iter().position(|&b| b == 0) {
+        if let Some(i) = memchr::memchr(0, rest) {
+            self.header_crc.update(&rest[..=i]);
             *pos += i + 1;
             Ok(true)
         } else {
             // The bytes seen so far cannot contain the terminator. Drop them
             // so a long filename does not have to sit in memory.
+            self.header_crc.update(rest);
             *pos = data.len();
             Ok(false)
         }
@@ -265,6 +304,7 @@ impl GzipDecoder {
         data: &[u8],
         base: usize,
         out: &mut Vec<u8>,
+        limit: usize,
     ) -> Result<(usize, Status), String> {
         let input_len = data.len() - base;
         let mut consumed = 0;
@@ -273,7 +313,8 @@ impl GzipDecoder {
             let in_before = self.inflate.total_in();
             let out_before = self.inflate.total_out();
             let start = out.len();
-            out.resize(start + OUT_CHUNK, 0);
+            let capacity = OUT_CHUNK.min(limit - start);
+            out.resize(start + capacity, 0);
             status = self
                 .inflate
                 .decompress(
@@ -281,10 +322,15 @@ impl GzipDecoder {
                     &mut out[start..],
                     FlushDecompress::None,
                 )
-                .map_err(|e| format!("deflate: {e}"))?;
+                .map_err(|e| {
+                    // The resized scratch region is not decoded data on error.
+                    out.truncate(start);
+                    format!("deflate: {e}")
+                })?;
             let in_delta = (self.inflate.total_in() - in_before) as usize;
             let out_delta = (self.inflate.total_out() - out_before) as usize;
             if in_delta > input_len - consumed {
+                out.truncate(start);
                 return Err("deflate reported consuming more bytes than it was given".into());
             }
             out.truncate(start + out_delta);
@@ -299,7 +345,10 @@ impl GzipDecoder {
             }
             // Output buffer filled: the inflater may still have bytes to emit
             // for input it already consumed. Loop with a fresh buffer.
-            if out_delta == OUT_CHUNK {
+            if out.len() >= limit {
+                break;
+            }
+            if out_delta == capacity {
                 continue;
             }
             if in_delta == 0 && out_delta == 0 {
@@ -453,7 +502,9 @@ mod tests {
     #[test]
     fn hcrc_is_not_passed_to_inflate() {
         // Fixed header with FHCRC set, plus two header-crc bytes and no body.
-        let header = [0x1f, 0x8b, 8, FHCRC, 0, 0, 0, 0, 0, 255, 0x00, 0x00];
+        let mut header = vec![0x1f, 0x8b, 8, FHCRC, 0, 0, 0, 0, 0, 255];
+        let crc = crc32fast::hash(&header) as u16;
+        header.extend_from_slice(&crc.to_le_bytes());
         let mut dec = GzipDecoder::new();
         let mut out = Vec::new();
         dec.feed(&header, &mut out).unwrap();
@@ -564,5 +615,59 @@ mod tests {
             prop_assert_eq!(&out, &expected);
             prop_assert!(dec.at_member_boundary());
         }
+    }
+
+    #[test]
+    fn limited_output_resumes_without_loss_or_duplicate_inflate() {
+        let raw = vec![b'x'; 3 * 1024 * 1024 + 17];
+        let mut data = gz(&raw);
+        data.extend_from_slice(&gz(b"next\n"));
+        let mut dec = GzipDecoder::new();
+        let mut got = Vec::new();
+        let mut out = Vec::new();
+        dec.feed_limited(&data, &mut out, 4096).unwrap();
+        loop {
+            assert!(out.len() <= 4096);
+            got.extend_from_slice(&out);
+            if !dec.needs_drain() {
+                break;
+            }
+            out.clear();
+            dec.feed_limited(&[], &mut out, 4096).unwrap();
+        }
+        let mut expected = raw;
+        expected.extend_from_slice(b"next\n");
+        assert_eq!(got, expected);
+        assert!(dec.at_member_boundary());
+        assert_eq!(dec.inflate_bytes(), (data.len() - 36) as u64);
+    }
+
+    #[test]
+    fn header_crc_includes_optional_fields_and_fragment_boundaries() {
+        let member = gz(b"payload\n");
+        let mut header = member[..10].to_vec();
+        header[3] = FHCRC | FEXTRA | FNAME | FCOMMENT;
+        header.extend_from_slice(b"\x03\0abcname\0comment\0");
+        let crc = crc32fast::hash(&header) as u16;
+        header.extend_from_slice(&crc.to_le_bytes());
+        let crc_pos = header.len() - 1;
+        header.extend_from_slice(&member[10..]);
+        let mut dec = GzipDecoder::new();
+        let mut out = Vec::new();
+        for byte in &header {
+            dec.feed(&[*byte], &mut out).unwrap();
+        }
+        assert_eq!(out, b"payload\n");
+        header[crc_pos] ^= 1;
+        assert!(decode_all(&header).unwrap_err().contains("header crc"));
+    }
+
+    #[test]
+    fn corrupt_deflate_does_not_emit_scratch_buffer() {
+        let member = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255, 7];
+        let mut dec = GzipDecoder::new();
+        let mut out = b"previous".to_vec();
+        assert!(dec.feed(&member, &mut out).is_err());
+        assert_eq!(out, b"previous");
     }
 }

@@ -1,0 +1,17 @@
+name: Feature request / 功能建议
+description: Describe the use case before proposing a flag or dependency.
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Use case
+      description: "What incremental-tail workflow is currently difficult? Include platform and file format."
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior and alternatives
+      description: "Consider pipe compatibility, raw-output fidelity, memory limits, and existing options."
+    validations:
+      required: true

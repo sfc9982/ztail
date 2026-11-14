@@ -1,0 +1,5 @@
+# Keep WSL/Linux scripts and generated sources stable across Windows checkouts.
+* text=auto eol=lf
+*.png binary
+*.gz binary
+*.zst binary

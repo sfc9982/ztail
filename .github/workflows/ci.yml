@@ -6,6 +6,9 @@ on:
     tags: ["v*"]
   pull_request:
 
+permissions:
+  contents: read
+
 concurrency:
   group: "ci-${{ github.ref }}"
   cancel-in-progress: true
@@ -19,35 +22,45 @@ jobs:
     name: fmt, clippy, test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+      - name: Packaging unit tests
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy (default features)
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Clippy (zstd)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Test
-        run: cargo test --all-targets
+        run: cargo test --locked --all-targets
       - name: Test with zstd
-        run: cargo test --all-targets --all-features
+        run: cargo test --locked --all-targets --all-features
+      - name: Source install/uninstall smoke test
+        run: python3 scripts/check_install.py --all-features
       - name: Doctests
-        run: cargo test --doc --all-features
+        run: cargo test --locked --doc --all-features
       - name: Docs
         env:
           RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc --no-deps --all-features
+        run: cargo doc --locked --no-deps --all-features
 
   msrv:
     name: MSRV 1.85
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@cfcaf53ba4c621917ec7f78a66bff7a8848ddad4 # 1.85.0
+        with:
+          toolchain: 1.85.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # proptest is pinned to ~1.11 because 1.12 needs Rust 1.88. If another
       # dev-dependency ever raises its MSRV, narrow this to `--lib --bins`
       # (dropping `--all-targets`) rather than deleting the job.
@@ -58,17 +71,20 @@ jobs:
     name: coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+        with:
+          tool: cargo-llvm-cov@0.9.1
       - name: Generate lcov report
         run: cargo llvm-cov --all-features --lcov --output-path lcov.info
       - name: Print coverage summary
         run: cargo llvm-cov report --summary-only
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: coverage-lcov
           path: lcov.info
@@ -78,15 +94,19 @@ jobs:
     name: static musl release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
           targets: x86_64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Install musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Release build
-        run: cargo build --release --target x86_64-unknown-linux-musl
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl
       - name: Binary is statically linked
         run: |
           set -euo pipefail
@@ -104,10 +124,10 @@ jobs:
           fi
           printf '%s\n' "$ldd_out" | grep -Eq 'statically linked|not a dynamic executable'
           "$bin" --version
-      - name: Upload static binary
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@v4
-        with:
-          name: ztail-x86_64-linux-musl
-          path: target/x86_64-unknown-linux-musl/release/ztail
-          if-no-files-found: error
+      - name: Smoke-test release archive (not for distribution)
+        run: |
+          python3 scripts/package.py \
+            --binary target/x86_64-unknown-linux-musl/release/ztail \
+            --target x86_64-unknown-linux-musl --flavor minimal \
+            --output target/dist-smoke --allow-unlicensed
+          (cd target/dist-smoke && sha256sum -c *.sha256)

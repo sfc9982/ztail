@@ -17,10 +17,10 @@ const OUT_CHUNK: usize = 64 * 1024;
 enum Kind {
     /// Not enough bytes to distinguish a magic prefix from plain text.
     Sniff(Vec<u8>),
-    Gzip(GzipDecoder),
+    Gzip(Box<GzipDecoder>),
     Plain,
     #[cfg(feature = "zstd")]
-    Zstd(ZstdDec),
+    Zstd(Box<ZstdDec>),
 }
 
 enum Detected {
@@ -48,6 +48,14 @@ impl Decoder {
             bytes_fed: 0,
             inflate_accum: 0,
         }
+    }
+
+    pub fn is_plain_prefix(prefix: &[u8]) -> bool {
+        matches!(detect(prefix), Detected::Plain)
+    }
+
+    pub fn select_plain(&mut self) {
+        self.kind = Kind::Plain;
     }
 
     /// Bytes accepted from the file. The CLI does not read this; tests do,
@@ -85,8 +93,27 @@ impl Decoder {
         self.inflate_accum += extra;
     }
 
+    #[cfg(test)]
     pub fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
-        if input.is_empty() {
+        self.feed_limited(input, out, usize::MAX)
+    }
+
+    pub fn needs_drain(&self) -> bool {
+        match &self.kind {
+            Kind::Gzip(dec) => dec.needs_drain(),
+            #[cfg(feature = "zstd")]
+            Kind::Zstd(dec) => dec.needs_drain,
+            _ => false,
+        }
+    }
+
+    pub fn feed_limited(
+        &mut self,
+        input: &[u8],
+        out: &mut Vec<u8>,
+        limit: usize,
+    ) -> Result<(), String> {
+        if input.is_empty() && !self.needs_drain() {
             return Ok(());
         }
         match &mut self.kind {
@@ -105,13 +132,13 @@ impl Decoder {
                     }
                     Detected::Gzip => {
                         let buffered = take_sniff(&mut self.kind);
-                        self.kind = Kind::Gzip(GzipDecoder::new());
-                        self.push_decoded(&buffered, out)
+                        self.kind = Kind::Gzip(Box::new(GzipDecoder::new()));
+                        self.push_decoded(&buffered, out, limit)
                     }
                     Detected::Zstd => {
                         let buffered = take_sniff(&mut self.kind);
                         self.kind = Kind::open_zstd()?;
-                        self.push_decoded(&buffered, out)
+                        self.push_decoded(&buffered, out, limit)
                     }
                     Detected::Xz => Err(
                         "xz/lzma is not supported (a static musl build would need liblzma)".into(),
@@ -125,12 +152,12 @@ impl Decoder {
             }
             Kind::Gzip(_) => {
                 self.bytes_fed += input.len() as u64;
-                self.push_decoded(input, out)
+                self.push_decoded(input, out, limit)
             }
             #[cfg(feature = "zstd")]
             Kind::Zstd(_) => {
                 self.bytes_fed += input.len() as u64;
-                self.push_decoded(input, out)
+                self.push_decoded(input, out, limit)
             }
         }
     }
@@ -164,15 +191,20 @@ impl Decoder {
         }
     }
 
-    fn push_decoded(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
+    fn push_decoded(
+        &mut self,
+        input: &[u8],
+        out: &mut Vec<u8>,
+        limit: usize,
+    ) -> Result<(), String> {
         match &mut self.kind {
             Kind::Plain => {
                 out.extend_from_slice(input);
                 Ok(())
             }
-            Kind::Gzip(dec) => dec.feed(input, out),
+            Kind::Gzip(dec) => dec.feed_limited(input, out, limit),
             #[cfg(feature = "zstd")]
-            Kind::Zstd(dec) => dec.feed(input, out),
+            Kind::Zstd(dec) => dec.feed_limited(input, out, limit),
             Kind::Sniff(_) => unreachable!("push_decoded on sniff"),
         }
     }
@@ -182,7 +214,7 @@ impl Kind {
     fn open_zstd() -> Result<Self, String> {
         #[cfg(feature = "zstd")]
         {
-            Ok(Kind::Zstd(ZstdDec::new()?))
+            Ok(Kind::Zstd(Box::new(ZstdDec::new()?)))
         }
         #[cfg(not(feature = "zstd"))]
         {
@@ -242,72 +274,96 @@ struct ZstdDec {
     buf: Vec<u8>,
     /// True after we have accepted frame bytes and before `remaining == 0`.
     in_frame: bool,
+    buf_pos: usize,
+    needs_drain: bool,
 }
 
 #[cfg(feature = "zstd")]
 impl ZstdDec {
     fn new() -> Result<Self, String> {
-        let dec = zstd::stream::raw::Decoder::new().map_err(|e| format!("zstd: {e}"))?;
+        let mut dec = zstd::stream::raw::Decoder::new().map_err(|e| format!("zstd: {e}"))?;
+        // A hostile frame may request a giant history window before emitting
+        // any bytes. Bound decoder-internal memory, not just our output Vec.
+        dec.set_parameter(zstd::zstd_safe::DParameter::WindowLogMax(26))
+            .map_err(|e| format!("zstd: {e}"))?;
         Ok(Self {
             dec,
             fed: 0,
             buf: Vec::new(),
             in_frame: false,
+            buf_pos: 0,
+            needs_drain: false,
         })
     }
 
-    fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
-        if self.buf.is_empty() {
-            if input.is_empty() {
-                return Ok(());
-            }
+    fn feed_limited(
+        &mut self,
+        input: &[u8],
+        out: &mut Vec<u8>,
+        limit: usize,
+    ) -> Result<(), String> {
+        let result = if self.buf.is_empty() && !input.is_empty() {
             let mut pos = 0;
-            let result = self.pump(input, &mut pos, out);
-            if pos < input.len() {
-                self.buf.extend_from_slice(&input[pos..]);
+            let result = self.pump(input, &mut pos, out, limit);
+            self.buf.extend_from_slice(&input[pos..]);
+            result
+        } else {
+            if !input.is_empty() {
+                self.buf.drain(..self.buf_pos);
+                self.buf_pos = 0;
+                self.buf.extend_from_slice(input);
             }
-            return result;
-        }
-        self.buf.extend_from_slice(input);
-        let data = std::mem::take(&mut self.buf);
-        let mut pos = 0;
-        let result = self.pump(&data, &mut pos, out);
-        if pos < data.len() {
-            self.buf.extend_from_slice(&data[pos..]);
-        }
+            let mut data = std::mem::take(&mut self.buf);
+            let mut pos = self.buf_pos;
+            let result = self.pump(&data, &mut pos, out, limit);
+            if pos == data.len() {
+                data.clear();
+                pos = 0;
+            }
+            self.buf = data;
+            self.buf_pos = pos;
+            result
+        };
+        self.needs_drain = out.len() >= limit;
         result
     }
 
     fn finish(&mut self, out: &mut Vec<u8>) -> Result<(), String> {
-        if !self.buf.is_empty() {
-            let data = std::mem::take(&mut self.buf);
-            let mut pos = 0;
-            self.pump(&data, &mut pos, out)?;
-            if pos < data.len() {
-                self.buf.extend_from_slice(&data[pos..]);
-            }
-        }
+        self.feed_limited(&[], out, usize::MAX)?;
         if !self.buf.is_empty() || self.in_frame {
             return Err("truncated zstd stream (incomplete frame)".into());
         }
         Ok(())
     }
 
-    fn pump(&mut self, data: &[u8], pos: &mut usize, out: &mut Vec<u8>) -> Result<(), String> {
+    fn pump(
+        &mut self,
+        data: &[u8],
+        pos: &mut usize,
+        out: &mut Vec<u8>,
+        limit: usize,
+    ) -> Result<(), String> {
         use zstd::stream::raw::Operation;
 
         loop {
+            if out.len() >= limit {
+                return Ok(());
+            }
             let input = if *pos < data.len() {
                 &data[*pos..]
             } else {
                 &[]
             };
             let start = out.len();
-            out.resize(start + OUT_CHUNK, 0);
+            let capacity = OUT_CHUNK.min(limit - start);
+            out.resize(start + capacity, 0);
             let status = self
                 .dec
                 .run_on_buffers(input, &mut out[start..])
-                .map_err(|e| format!("zstd: {e}"))?;
+                .map_err(|e| {
+                    out.truncate(start);
+                    format!("zstd: {e}")
+                })?;
             out.truncate(start + status.bytes_written);
             *pos += status.bytes_read;
             self.fed += status.bytes_read as u64;
@@ -318,7 +374,7 @@ impl ZstdDec {
                 // End of a frame. More frames may follow in the buffer.
                 self.in_frame = false;
             }
-            if status.bytes_written == OUT_CHUNK {
+            if status.bytes_written == capacity {
                 // Output buffer was full; decoder may still have pending bytes
                 // even with no remaining input.
                 continue;
@@ -524,5 +580,79 @@ mod tests {
             prop_assert_eq!(&out, &payload);
             prop_assert_eq!(dec.bytes_fed(), blob.len() as u64);
         }
+    }
+
+    #[test]
+    fn bounded_gzip_handles_input_and_output_boundaries() {
+        let raw: Vec<u8> = (0..100_000).map(|i| (i % 251) as u8).collect();
+        let mut compressed = gz(&raw);
+        compressed.extend_from_slice(&gz(b"next\n"));
+        for chunk in [1, 7, 64, 4096] {
+            for limit in [1, 17, 1024] {
+                let mut dec = Decoder::new();
+                let mut got = Vec::new();
+                let mut out = Vec::new();
+                for input in compressed.chunks(chunk) {
+                    out.clear();
+                    dec.feed_limited(input, &mut out, limit).unwrap();
+                    assert!(out.len() <= limit);
+                    got.extend_from_slice(&out);
+                    while dec.needs_drain() {
+                        out.clear();
+                        dec.feed_limited(&[], &mut out, limit).unwrap();
+                        assert!(out.len() <= limit);
+                        got.extend_from_slice(&out);
+                    }
+                }
+                out.clear();
+                dec.finish(&mut out).unwrap();
+                got.extend_from_slice(&out);
+                let mut expected = raw.clone();
+                expected.extend_from_slice(b"next\n");
+                assert_eq!(got, expected, "chunk={chunk}, limit={limit}");
+            }
+        }
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn bounded_zstd_resumes_concatenated_high_ratio_frames() {
+        let raw = vec![b'x'; 3 * 1024 * 1024 + 17];
+        let mut compressed = zstd::stream::encode_all(raw.as_slice(), 1).unwrap();
+        compressed.extend_from_slice(&zstd::stream::encode_all(b"next\n".as_slice(), 1).unwrap());
+        for chunk in [1, 17, compressed.len()] {
+            let mut dec = Decoder::new();
+            let mut got = Vec::new();
+            let mut out = Vec::new();
+            for input in compressed.chunks(chunk) {
+                out.clear();
+                dec.feed_limited(input, &mut out, 4096).unwrap();
+                assert!(out.len() <= 4096);
+                got.extend_from_slice(&out);
+                while dec.needs_drain() {
+                    out.clear();
+                    dec.feed_limited(&[], &mut out, 4096).unwrap();
+                    assert!(out.len() <= 4096);
+                    got.extend_from_slice(&out);
+                }
+            }
+            out.clear();
+            dec.finish(&mut out).unwrap();
+            got.extend_from_slice(&out);
+            let mut expected = raw.clone();
+            expected.extend_from_slice(b"next\n");
+            assert_eq!(got, expected);
+        }
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn zstd_rejects_excessive_history_window() {
+        // No content-size field, a 128 MiB window, final empty raw block.
+        let frame = [0x28, 0xb5, 0x2f, 0xfd, 0, 17 << 3, 1, 0, 0];
+        let mut dec = Decoder::new();
+        let mut out = Vec::new();
+        assert!(dec.feed(&frame, &mut out).unwrap_err().contains("zstd"));
+        assert!(out.is_empty());
     }
 }

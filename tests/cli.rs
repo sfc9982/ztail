@@ -699,3 +699,407 @@ fn zstd_file_without_feature_errors() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn headers_and_diagnostics_escape_hostile_file_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unsafe\nforged\x1b[31m.log");
+    std::fs::write(&path, b"safe payload\n").unwrap();
+    let output = Command::new(bin()).arg("-v").arg(&path).output().unwrap();
+    assert!(output.status.success());
+    assert!(!output.stdout.contains(&0x1b));
+    assert_eq!(output.stdout.iter().filter(|&&b| b == b'\n').count(), 2);
+    assert!(contains(&output.stdout, b"\\nforged\\u{1b}[31m.log"));
+    std::fs::remove_file(&path).unwrap();
+    let output = Command::new(bin()).arg(&path).output().unwrap();
+    assert!(!output.status.success());
+    assert!(!output.stderr.contains(&0x1b));
+    assert_eq!(output.stderr.iter().filter(|&&b| b == b'\n').count(), 1);
+}
+
+#[test]
+fn non_broken_pipe_output_errors_exit_nonzero() {
+    if !std::path::Path::new("/dev/full").exists() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data");
+    std::fs::write(&path, b"hello\n").unwrap();
+    let output = Command::new(bin())
+        .arg(&path)
+        .stdout(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap(),
+        )
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(contains(&output.stderr, b"write error"));
+}
+
+// Do not modify the test process environment: these subprocesses are isolated.
+fn ui_command() -> Command {
+    let mut command = Command::new(bin());
+    for name in [
+        "LC_ALL",
+        "LC_MESSAGES",
+        "LANG",
+        "NO_COLOR",
+        "CLICOLOR",
+        "CLICOLOR_FORCE",
+        "TERM",
+    ] {
+        command.env_remove(name);
+    }
+    command.env("LC_ALL", "C");
+    command
+}
+
+#[test]
+fn completions_for_all_supported_shells() {
+    for (shell, marker) in [
+        ("bash", "complete"),
+        ("zsh", "#compdef ztail"),
+        ("fish", "complete -c ztail"),
+        ("elvish", "edit:completion:arg-completer"),
+        ("powershell", "Register-ArgumentCompleter"),
+    ] {
+        let output = ui_command()
+            .args(["--color", "always", "--completions", shell])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{shell}: {:?}", output.stderr);
+        let script = String::from_utf8(output.stdout).unwrap();
+        assert!(script.contains(marker), "{shell}: {script}");
+        assert!(script.contains("language"), "{shell}: missing new options");
+        assert!(!script.contains('\x1b'));
+        assert!(output.stderr.is_empty());
+    }
+}
+
+#[test]
+fn localized_help_and_runtime_messages() {
+    let output = ui_command()
+        .args(["--language=zh-CN", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(help.contains("用法："), "{help}");
+    assert!(help.contains("补全脚本"), "{help}");
+    assert!(help.contains("选项"), "{help}");
+    let output = ui_command().args(["--language", "zh-CN"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("缺少文件参数"));
+    let output = ui_command()
+        .args(["--language", "zh-CN", "--unknown"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("命令行参数错误"));
+}
+
+#[test]
+fn locale_environment_precedence_and_explicit_override() {
+    for (all, messages, lang, explicit, chinese) in [
+        ("zh_CN.UTF-8", "C", "C", false, true),
+        ("C", "zh_CN.UTF-8", "zh_CN.UTF-8", false, false),
+        ("", "zh_CN.UTF-8", "C", false, true),
+        ("", "", "zh_SG.UTF-8", false, true),
+        ("", "", "fr_FR.UTF-8", false, false),
+        ("zh_CN.UTF-8", "", "", true, false),
+    ] {
+        let mut command = ui_command();
+        command
+            .env("LC_ALL", all)
+            .env("LC_MESSAGES", messages)
+            .env("LANG", lang);
+        if explicit {
+            command.args(["--language", "en"]);
+        }
+        let output = command.arg("--help").output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).contains("用法："),
+            chinese
+        );
+    }
+}
+
+#[test]
+fn explicit_color_and_environment_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("raw.log");
+    let raw = b"log \x1b[31mraw\x1b[0m\n";
+    std::fs::write(&path, raw).unwrap();
+    for (mode, no_color, force, expected) in [
+        ("auto", "", "", false),
+        ("auto", "1", "1", false),
+        ("auto", "", "1", true),
+        ("always", "1", "", true),
+        ("never", "", "1", false),
+    ] {
+        let output = ui_command()
+            .env("NO_COLOR", no_color)
+            .env("CLICOLOR_FORCE", force)
+            .args(["--color", mode, "-v"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.ends_with(raw), "payload was modified");
+        assert_eq!(output.stdout.starts_with(b"\x1b[1;36m"), expected);
+        let diagnostic = ui_command()
+            .env("NO_COLOR", no_color)
+            .env("CLICOLOR_FORCE", force)
+            .args(["--color", mode])
+            .output()
+            .unwrap();
+        assert_eq!(diagnostic.stderr.starts_with(b"\x1b[33m"), expected);
+    }
+    let output = ui_command()
+        .args(["--color=always", "-q"])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert_eq!(output.stdout, raw);
+}
+
+#[test]
+fn help_colors_are_explicit_and_disabled_in_pipes() {
+    for (mode, expected) in [("always", true), ("never", false), ("auto", false)] {
+        let output = ui_command()
+            .args(["--color", mode, "--help"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout.contains(&0x1b), expected);
+    }
+}
+
+#[test]
+fn presentation_flags_do_not_become_subcommands_or_consume_filenames() {
+    let dir = tempfile::tempdir().unwrap();
+    for filename in ["completions", "--language=zh-CN", "--help"] {
+        std::fs::write(dir.path().join(filename), b"ok\n").unwrap();
+        let output = ui_command()
+            .current_dir(dir.path())
+            .args(["--", filename])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"ok\n");
+    }
+    // A value belonging to -n must not change bootstrap presentation.
+    let output = ui_command()
+        .args(["-vn", "--language=zh-CN"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("命令行参数错误"));
+}
+
+#[test]
+fn invalid_presentation_values_exit_two() {
+    for args in [
+        ["--language", "xx"],
+        ["--color", "rainbow"],
+        ["--completions", "cmd"],
+    ] {
+        let output = ui_command().args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn parser_diagnostics_cannot_inject_ansi() {
+    let output = ui_command()
+        .args(["--color=never", "--unknown\x1b[31m"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!output.stderr.contains(&0x1b));
+}
+
+fn pseudo_terminal() -> (std::fs::File, std::fs::File) {
+    use std::os::fd::FromRawFd;
+    let (mut master, mut slave) = (-1, -1);
+    let result = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(result, 0, "openpty: {}", std::io::Error::last_os_error());
+    // openpty created two fresh, independently owned descriptors.
+    unsafe {
+        (
+            std::fs::File::from_raw_fd(master),
+            std::fs::File::from_raw_fd(slave),
+        )
+    }
+}
+
+fn read_terminal(mut master: std::fs::File) -> Vec<u8> {
+    let mut data = Vec::new();
+    // Linux signals EIO when all slave handles close; bytes read before EIO
+    // remain in data. BSD systems may return EOF instead.
+    if let Err(err) = master.read_to_end(&mut data) {
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+    }
+    data
+}
+
+#[test]
+fn auto_color_detects_each_terminal_stream_independently() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("terminal.log");
+    std::fs::write(&path, b"payload\n").unwrap();
+    for (term, no_color, expected) in [
+        ("xterm-256color", "", true),
+        ("dumb", "", false),
+        ("xterm", "1", false),
+    ] {
+        let (master, slave) = pseudo_terminal();
+        let mut command = ui_command();
+        command
+            .env("TERM", term)
+            .env("NO_COLOR", no_color)
+            .arg("-v")
+            .arg(&path)
+            .arg(dir.path().join("missing"))
+            .stdout(Stdio::from(slave));
+        let output = command.output().unwrap();
+        drop(command);
+        let terminal = read_terminal(master);
+        assert_eq!(terminal.starts_with(b"\x1b[1;36m"), expected);
+        assert!(
+            !output.stderr.contains(&0x1b),
+            "piped stderr must remain plain"
+        );
+        let (master, slave) = pseudo_terminal();
+        let mut command = ui_command();
+        command
+            .env("TERM", term)
+            .env("NO_COLOR", no_color)
+            .arg("-v")
+            .arg(&path)
+            .arg(dir.path().join("missing"))
+            .stderr(Stdio::from(slave));
+        let output = command.output().unwrap();
+        drop(command);
+        assert_eq!(read_terminal(master).starts_with(b"\x1b[33m"), expected);
+        assert!(
+            !output.stdout.contains(&0x1b),
+            "piped stdout must remain plain"
+        );
+    }
+}
+
+#[test]
+fn help_and_completion_exit_cleanly_when_pipe_is_closed() {
+    use std::os::fd::FromRawFd;
+    for args in [
+        vec!["--help"],
+        vec!["--completions", "bash"],
+        vec!["--manpage"],
+        vec!["--build-info"],
+        vec!["--language=zh-CN", "--help"],
+    ] {
+        let mut fds = [-1, -1];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // Close the read end before spawning, forcing EPIPE on the first write.
+        let (read, write) = unsafe {
+            (
+                std::fs::File::from_raw_fd(fds[0]),
+                std::fs::File::from_raw_fd(fds[1]),
+            )
+        };
+        drop(read);
+        let output = ui_command()
+            .args(args)
+            .stdout(Stdio::from(write))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert!(output.stderr.is_empty());
+    }
+}
+
+#[test]
+fn build_info_is_machine_readable_and_matches_compiled_features() {
+    let output = ui_command()
+        .args(["--color=always", "--language=zh-CN", "--build-info"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert!(!output.stdout.contains(&0x1b));
+    let info: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(info["schema_version"], 1);
+    assert_eq!(info["name"], "ztail");
+    assert_eq!(info["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(info["target"], env!("ZTAIL_BUILD_TARGET"));
+    let mut expected = vec!["gzip", "plain"];
+    if cfg!(feature = "zstd") {
+        expected.push("zstd");
+    }
+    assert_eq!(info["features"], serde_json::json!(expected));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(!text.contains(env!("CARGO_MANIFEST_DIR")));
+}
+
+#[test]
+fn manpage_uses_cli_options_and_is_reproducible_without_colors() {
+    for language in ["en", "zh-CN"] {
+        let output = ui_command()
+            .args(["--color=always", "--language", language, "--manpage"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert!(output.stderr.is_empty());
+        assert!(!output.stdout.contains(&0x1b));
+        let page = String::from_utf8(output.stdout.clone())
+            .unwrap()
+            .replace("\\-", "-");
+        assert!(page.contains(".TH ZTAIL"), "{page}");
+        for flag in [
+            "--completions",
+            "--build-info",
+            "--manpage",
+            "--language",
+            "--follow-name",
+        ] {
+            assert!(page.contains(flag), "missing {flag}: {page}");
+        }
+        assert!(page.contains(if language == "en" {
+            "EXIT STATUS"
+        } else {
+            "退出状态"
+        }));
+        let repeated = ui_command()
+            .args(["--language", language, "--manpage"])
+            .output()
+            .unwrap();
+        assert_eq!(output.stdout, repeated.stdout);
+    }
+}
+
+#[test]
+fn output_generators_are_mutually_exclusive() {
+    for args in [
+        vec!["--manpage", "--build-info"],
+        vec!["--manpage", "--completions=bash"],
+        vec!["--build-info", "--completions=bash"],
+    ] {
+        let output = ui_command().args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
+}

@@ -44,10 +44,15 @@ impl Watch {
                     }
                     if let Err(err) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
                         if !warned {
-                            eprintln!(
-                                "ztail: warning: cannot watch {}: {err}; polling instead",
-                                dir.display()
-                            );
+                            crate::presentation::warn(&format!(
+                                "ztail: {} {}: {err}; {}",
+                                crate::presentation::text(
+                                    "warning: cannot watch",
+                                    "警告：无法监控"
+                                ),
+                                crate::display_path(&dir),
+                                crate::presentation::text("polling instead", "改用轮询")
+                            ));
                             warned = true;
                         }
                     }
@@ -58,7 +63,15 @@ impl Watch {
                 }
             }
             Err(err) => {
-                eprintln!("ztail: warning: filesystem events unavailable ({err}); polling instead");
+                crate::presentation::warn(&format!(
+                    "ztail: {} ({err}); {}",
+                    crate::presentation::text(
+                        "warning: filesystem events unavailable",
+                        "警告：文件系统事件不可用"
+                    ),
+                    crate::presentation::text("polling instead", "改用轮询")
+                ));
+
                 Self {
                     _watcher: None,
                     rx: None,
@@ -96,7 +109,9 @@ impl Watch {
             let slice = remaining.min(Duration::from_millis(200));
             match rx.recv_timeout(slice) {
                 Ok(()) => {
-                    while rx.try_recv().is_ok() {}
+                    // Bounded coalescing: an event flood must not trap us
+                    // draining notifications instead of checking stop/files.
+                    let _ = rx.try_recv();
                     return;
                 }
                 Err(RecvTimeoutError::Timeout) => continue,

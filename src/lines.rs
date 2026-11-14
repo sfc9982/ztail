@@ -26,7 +26,7 @@ impl LineBuffer {
     /// Append decompressed (or plain) bytes.
     ///
     /// Returns every line that became complete, including its trailing `\n`.
-    /// A trailing fragment with no newline stays buffered, unless it exceeds
+    /// A trailing fragment with no newline stays buffered, unless it reaches
     /// [`MAX_PARTIAL_LINE`], in which case it is force-emitted without a
     /// newline so memory stays bounded.
     #[cfg(test)]
@@ -44,29 +44,33 @@ impl LineBuffer {
     /// entry so a long file allocates about N line buffers.
     pub fn push_with(&mut self, data: &[u8], mut on_line: impl FnMut(Vec<u8>) -> Option<Vec<u8>>) {
         let mut spare: Option<Vec<u8>> = None;
-        let mut start = 0;
-        for (i, &byte) in data.iter().enumerate() {
-            if byte == b'\n' {
-                self.partial.extend_from_slice(&data[start..=i]);
-                let line = take_line(&mut self.partial, &mut spare);
-                spare = on_line(line);
-                start = i + 1;
+        self.push_slices(data, |bytes| {
+            let mut line = spare.take().unwrap_or_default();
+            line.clear();
+            line.extend_from_slice(bytes);
+            spare = on_line(line);
+        });
+    }
+
+    /// Lending output avoids allocating one Vec per tiny line in the CLI.
+    /// Entire records already in `data` are emitted without an extra copy.
+    pub fn push_slices(&mut self, mut data: &[u8], mut on_line: impl FnMut(&[u8])) {
+        while !data.is_empty() {
+            let room = MAX_PARTIAL_LINE - self.partial.len();
+            let window = &data[..data.len().min(room)];
+            let newline = memchr::memchr(b'\n', window);
+            let len = newline.map_or(window.len(), |i| i + 1);
+            let emit = newline.is_some() || self.partial.len() + len == MAX_PARTIAL_LINE;
+            if self.partial.is_empty() && emit {
+                on_line(&window[..len]);
+            } else {
+                self.partial.extend_from_slice(&window[..len]);
+                if emit {
+                    on_line(&self.partial);
+                    self.partial.clear();
+                }
             }
-        }
-        if start < data.len() {
-            self.partial.extend_from_slice(&data[start..]);
-            while self.partial.len() > MAX_PARTIAL_LINE {
-                let rest = self.partial.split_off(MAX_PARTIAL_LINE);
-                let line = if let Some(mut slot) = spare.take() {
-                    slot.clear();
-                    slot.extend_from_slice(&self.partial);
-                    self.partial = rest;
-                    slot
-                } else {
-                    std::mem::replace(&mut self.partial, rest)
-                };
-                spare = on_line(line);
-            }
+            data = &data[len..];
         }
     }
 
@@ -100,17 +104,6 @@ pub fn retain_last(
     }
     ring.push_back(line);
     None
-}
-
-fn take_line(partial: &mut Vec<u8>, spare: &mut Option<Vec<u8>>) -> Vec<u8> {
-    if let Some(mut slot) = spare.take() {
-        slot.clear();
-        slot.extend_from_slice(partial);
-        partial.clear();
-        slot
-    } else {
-        std::mem::take(partial)
-    }
 }
 
 #[cfg(test)]
@@ -259,6 +252,31 @@ mod tests {
 
             let kept: Vec<Vec<u8>> = ring.into_iter().collect();
             prop_assert_eq!(kept, expected);
+        }
+    }
+
+    #[test]
+    fn long_records_are_bounded_and_chunk_independent() {
+        for len in [
+            MAX_PARTIAL_LINE - 1,
+            MAX_PARTIAL_LINE,
+            MAX_PARTIAL_LINE + 1,
+            MAX_PARTIAL_LINE * 3,
+        ] {
+            let mut input = vec![b'x'; len];
+            input.extend_from_slice(b"\nnext\npartial");
+            let mut whole = LineBuffer::new();
+            let expected = whole.push(&input);
+            assert!(expected.iter().all(|line| line.len() <= MAX_PARTIAL_LINE));
+            for size in [1, 997, 65536, MAX_PARTIAL_LINE + 1] {
+                let mut split = LineBuffer::new();
+                let mut got = Vec::new();
+                for chunk in input.chunks(size) {
+                    got.extend(split.push(chunk));
+                }
+                assert_eq!(got, expected, "len={len}, chunk={size}");
+                assert_eq!(split.partial(), whole.partial());
+            }
         }
     }
 }

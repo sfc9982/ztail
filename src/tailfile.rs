@@ -13,8 +13,9 @@
 //! cursor. Each consume snapshots the end offset (and a byte budget) so a
 //! writer that outpaces the reader cannot starve other files or Ctrl+C.
 
-use std::fs::{File, Metadata};
+use std::fs::{File, Metadata, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -26,6 +27,9 @@ const CHUNK: usize = 256 * 1024;
 const MAX_BYTES_PER_CONSUME: u64 = 8 * 1024 * 1024;
 /// Bytes kept just behind the cursor to detect truncate-and-regrow.
 const FINGERPRINT: usize = 64;
+/// Bound decompression and result allocation separately from compressed I/O.
+const MAX_OUTPUT_PER_CONSUME: usize = 1024 * 1024;
+const DECODE_OUTPUT: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Notice {
@@ -68,8 +72,10 @@ pub enum TailError {
 impl std::fmt::Display for TailError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TailError::Io { path, source } => write!(f, "{}: {source}", path.display()),
-            TailError::Format { path, message } => write!(f, "{}: {message}", path.display()),
+            TailError::Io { path, source } => write!(f, "{}: {source}", crate::display_path(path)),
+            TailError::Format { path, message } => {
+                write!(f, "{}: {message}", crate::display_path(path))
+            }
         }
     }
 }
@@ -93,8 +99,9 @@ impl TailError {
 }
 
 struct NameChange {
-    notice: Notice,
+    notice: Option<Notice>,
     drained: Vec<Vec<u8>>,
+    error: Option<TailError>,
 }
 
 pub struct TailFile {
@@ -127,26 +134,14 @@ pub struct TailFile {
     missing_announced: bool,
     /// Upper bound for the current `consume` call; `None` means use live size.
     read_until: Option<u64>,
+    /// Frozen old-inode EOF once rotation/unlink draining begins.
+    drain_end: Option<u64>,
+    batch_output: bool,
 }
 
 impl TailFile {
     pub fn open(path: &Path, follow_name: bool) -> Result<Self, TailError> {
-        // Stat first so a FIFO without a writer cannot hang `open`.
-        // Stat first so a FIFO without a writer cannot hang `File::open`.
-        let meta = std::fs::metadata(path).map_err(|source| TailError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        require_regular(path, &meta)?;
-        let file = File::open(path).map_err(|source| TailError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        let meta = file.metadata().map_err(|source| TailError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        require_regular(path, &meta)?;
+        let (file, meta) = open_regular(path)?;
         let (dev, ino) = file_id(&meta);
         Ok(Self {
             path: path.to_path_buf(),
@@ -169,6 +164,8 @@ impl TailFile {
             did_initial: false,
             missing_announced: false,
             read_until: None,
+            drain_end: None,
+            batch_output: false,
         })
     }
 
@@ -195,6 +192,8 @@ impl TailFile {
             did_initial: false,
             missing_announced: true,
             read_until: None,
+            drain_end: None,
+            batch_output: false,
         }
     }
 
@@ -221,8 +220,22 @@ impl TailFile {
     /// While following, a short prefix might still grow into a gzip or zstd
     /// header, so it is left buffered.
     pub fn read_initial(&mut self, n: usize, flush: bool) -> Result<Vec<Vec<u8>>, TailError> {
+        self.read_initial_interruptible(n, flush, &|| false)
+    }
+
+    /// Like `read_initial`, but checks cancellation between bounded decoder
+    /// steps, including when a small compressed file expands enormously.
+    pub fn read_initial_interruptible(
+        &mut self,
+        n: usize,
+        flush: bool,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Vec<Vec<u8>>, TailError> {
         self.n = n;
-        let (lines, error) = self.consume(Some(n), flush)?;
+        if !self.did_initial && self.offset == 0 {
+            self.seek_plain_tail(n, stop)?;
+        }
+        let (lines, error) = self.consume_interruptible(Some(n), flush, stop)?;
         self.did_initial = true;
         if let Some(err) = error {
             return Err(err);
@@ -230,19 +243,91 @@ impl TailFile {
         Ok(lines)
     }
 
+    /// For ordinary text, find the last N complete records backwards. Limit
+    /// speculative scanning to 1 MiB; large N / long records fall back to the
+    /// forward path, preserving its deterministic long-record policy.
+    fn seek_plain_tail(&mut self, n: usize, stop: &dyn Fn() -> bool) -> Result<(), TailError> {
+        let Some(file) = &mut self.file else {
+            return Ok(());
+        };
+        let io_error = |source| TailError::Io {
+            path: self.path.clone(),
+            source,
+        };
+        let len = file.metadata().map_err(io_error)?.len();
+        if len <= CHUNK as u64 {
+            return Ok(());
+        }
+        let mut magic = [0; 6];
+        if read_exact_at(file, &mut magic, 0).is_err() || !Decoder::is_plain_prefix(&magic) {
+            return Ok(());
+        }
+        let mut end = len;
+        let lower = len.saturating_sub(crate::lines::MAX_PARTIAL_LINE as u64);
+        let mut seen = 0usize;
+        let mut buf = vec![0; DECODE_OUTPUT];
+        while end > lower {
+            if stop() {
+                return Err(io_error(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "read cancelled",
+                )));
+            }
+            let start = end.saturating_sub(buf.len() as u64).max(lower);
+            let chunk = &mut buf[..(end - start) as usize];
+            if read_exact_at(file, chunk, start).is_err() {
+                // Concurrent shrink: leave the forward reader at offset zero.
+                return Ok(());
+            }
+            for i in memchr::memrchr_iter(b'\n', chunk) {
+                if seen == n {
+                    let offset = start + i as u64 + 1;
+                    file.seek(SeekFrom::Start(offset)).map_err(io_error)?;
+                    self.offset = offset;
+                    self.decoder.select_plain();
+                    return Ok(());
+                }
+                seen += 1;
+            }
+            end = start;
+        }
+        Ok(())
+    }
+
+    /// Work already observed but not yet consumed because a poll hit a budget.
+    /// Callers must not sleep merely because no complete line was emitted.
+    pub fn has_pending_work(&self) -> bool {
+        self.file.is_some() && (self.offset < self.last_size || self.decoder.needs_drain())
+    }
+
     /// Read whatever was appended, and apply rotation / truncation policy.
     pub fn poll(&mut self) -> Result<Update, TailError> {
+        self.poll_interruptible(&|| false)
+    }
+
+    /// CLI-only output batching; the public poll API still returns one Vec
+    /// per record. This bounds allocation overhead even for newline-only logs.
+    pub(crate) fn poll_batched(&mut self, stop: &dyn Fn() -> bool) -> Result<Update, TailError> {
+        self.batch_output = true;
+        let result = self.poll_interruptible(stop);
+        self.batch_output = false;
+        result
+    }
+
+    /// Includes cancellation during the initial view of a late-appearing file.
+    pub fn poll_interruptible(&mut self, stop: &dyn Fn() -> bool) -> Result<Update, TailError> {
         if self.follow_name {
             if let Some(change) = self.sync_name()? {
                 let (mut lines, error) = match change.notice {
-                    Notice::Appeared => {
+                    Some(Notice::Appeared) => {
                         let n = self.n;
-                        let result = self.consume(Some(n), false)?;
+                        let result = self.consume_interruptible(Some(n), false, stop)?;
                         self.did_initial = true;
                         result
                     }
-                    Notice::Inaccessible => (Vec::new(), None),
-                    Notice::Replaced | Notice::Truncated => self.consume(None, false)?,
+                    Some(Notice::Inaccessible) => (Vec::new(), None),
+                    Some(Notice::Replaced | Notice::Truncated) => self.consume(None, false)?,
+                    None => (Vec::new(), change.error),
                 };
                 if !change.drained.is_empty() {
                     let mut combined = change.drained;
@@ -251,7 +336,7 @@ impl TailFile {
                 }
                 return Ok(Update {
                     lines,
-                    notice: Some(change.notice),
+                    notice: change.notice,
                     error,
                 });
             }
@@ -286,6 +371,7 @@ impl TailFile {
                     Some(_) => dev != self.dev || ino != self.ino,
                 };
                 if !changed {
+                    self.drain_end = None;
                     return Ok(None);
                 }
                 let notice = if self.file.is_none() && !self.did_initial {
@@ -295,22 +381,51 @@ impl TailFile {
                 };
                 // Drain unread bytes from the old inode before replacing it.
                 let drained = if self.file.is_some() {
+                    self.begin_drain()?;
                     let (lines, error) = self.consume(None, false)?;
-                    if let Some(err) = error {
-                        return Err(err);
+                    if error.is_some() || self.has_pending_work() {
+                        return Ok(Some(NameChange {
+                            notice: None,
+                            drained: lines,
+                            error,
+                        }));
                     }
                     lines
                 } else {
                     Vec::new()
                 };
-                self.reopen()?;
-                Ok(Some(NameChange { notice, drained }))
+                match self.reopen() {
+                    Ok(()) => Ok(Some(NameChange {
+                        notice: Some(notice),
+                        drained,
+                        error: None,
+                    })),
+                    // The new path vanished between stat and open. Preserve
+                    // the old output and retry rather than killing this slot.
+                    Err(err) if err.kind() == Some(io::ErrorKind::NotFound) => {
+                        Ok(Some(NameChange {
+                            notice: None,
+                            drained,
+                            error: None,
+                        }))
+                    }
+                    Err(err) => Ok(Some(NameChange {
+                        notice: None,
+                        drained,
+                        error: Some(err),
+                    })),
+                }
             }
             Err(source) if source.kind() == io::ErrorKind::NotFound => {
                 if self.file.is_some() && !self.missing_announced {
+                    self.begin_drain()?;
                     let (drained, error) = self.consume(None, false)?;
-                    if let Some(err) = error {
-                        return Err(err);
+                    if error.is_some() || self.has_pending_work() {
+                        return Ok(Some(NameChange {
+                            notice: None,
+                            drained,
+                            error,
+                        }));
                     }
                     self.file = None;
                     self.offset = 0;
@@ -320,8 +435,9 @@ impl TailFile {
                     self.lines.clear();
                     self.missing_announced = true;
                     return Ok(Some(NameChange {
-                        notice: Notice::Inaccessible,
+                        notice: Some(Notice::Inaccessible),
                         drained,
+                        error: None,
                     }));
                 }
                 Ok(None)
@@ -333,23 +449,29 @@ impl TailFile {
         }
     }
 
+    fn begin_drain(&mut self) -> Result<(), TailError> {
+        if self.drain_end.is_none() {
+            if let Some(file) = &self.file {
+                let meta = file.metadata().map_err(|source| TailError::Io {
+                    path: self.path.clone(),
+                    source,
+                })?;
+                self.drain_end = Some(meta.len());
+            }
+        }
+        Ok(())
+    }
+
     fn reopen(&mut self) -> Result<(), TailError> {
-        let file = File::open(&self.path).map_err(|source| TailError::Io {
-            path: self.path.clone(),
-            source,
-        })?;
-        // Identity must come from the descriptor we opened, not an earlier
-        // path lookup that can race with another rotation.
-        let meta = file.metadata().map_err(|source| TailError::Io {
-            path: self.path.clone(),
-            source,
-        })?;
-        require_regular(&self.path, &meta)?;
+        // Validate the descriptor actually opened; the path can change at any
+        // point, including changing into a FIFO between stat and open.
+        let (file, meta) = open_regular(&self.path)?;
         let (dev, ino) = file_id(&meta);
         self.file = Some(file);
         self.dev = dev;
         self.ino = ino;
         self.offset = 0;
+        self.drain_end = None;
         self.last_size = meta.len();
         self.fp_len = 0;
         self.fp_mtime = None;
@@ -380,20 +502,16 @@ impl TailFile {
             let fp_len = self.fingerprint.len() as u64;
             let start = self.offset - fp_len;
             let mut buf = vec![0u8; self.fingerprint.len()];
-            file.seek(SeekFrom::Start(start))
-                .map_err(|source| TailError::Io {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            file.read_exact(&mut buf).map_err(|source| TailError::Io {
-                path: self.path.clone(),
-                source,
-            })?;
-            file.seek(SeekFrom::Start(self.offset))
-                .map_err(|source| TailError::Io {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            match read_exact_at(file, &mut buf, start) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(true),
+                Err(source) => {
+                    return Err(TailError::Io {
+                        path: self.path.clone(),
+                        source,
+                    })
+                }
+            }
             if buf != self.fingerprint {
                 self.last_size = len;
                 return Ok(true);
@@ -411,6 +529,7 @@ impl TailFile {
                 source,
             })?;
         self.offset = 0;
+        self.drain_end = None;
         self.fp_offset = 0;
         self.fp_len = 0;
         self.fp_mtime = None;
@@ -429,6 +548,15 @@ impl TailFile {
         keep_last: Option<usize>,
         flush: bool,
     ) -> Result<(Vec<Vec<u8>>, Option<TailError>), TailError> {
+        self.consume_interruptible(keep_last, flush, &|| false)
+    }
+
+    fn consume_interruptible(
+        &mut self,
+        keep_last: Option<usize>,
+        flush: bool,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<(Vec<Vec<u8>>, Option<TailError>), TailError> {
         let mut ring = std::collections::VecDeque::new();
         let mut all = Vec::new();
         let mut decompressed = Vec::new();
@@ -437,11 +565,19 @@ impl TailFile {
         // Snapshot the readable end so a racing writer cannot keep this call
         // looping forever, and so memory for `all` stays proportional to one
         // poll's budget rather than an unbounded append stream.
-        self.read_until = self.snapshot_end()?;
+        self.read_until = self.snapshot_end(keep_last.is_none())?;
+        let mut produced = 0usize;
 
         loop {
-            let n = self.read_chunk()?;
-            if n == 0 {
+            if stop() {
+                return Err(TailError::Io {
+                    path: self.path.clone(),
+                    source: io::Error::new(io::ErrorKind::Interrupted, "read cancelled"),
+                });
+            }
+            let draining = self.decoder.needs_drain();
+            let n = if draining { 0 } else { self.read_chunk()? };
+            if n == 0 && !draining {
                 if flush {
                     decompressed.clear();
                     match self.decoder.finish(&mut decompressed) {
@@ -461,8 +597,11 @@ impl TailFile {
             }
             decompressed.clear();
             let chunk = std::mem::take(&mut self.read_buf);
-            let fed = self.decoder.feed(&chunk[..n], &mut decompressed);
+            let fed = self
+                .decoder
+                .feed_limited(&chunk[..n], &mut decompressed, DECODE_OUTPUT);
             self.read_buf = chunk;
+            produced += decompressed.len();
             match fed {
                 Ok(()) => {
                     self.take_lines(&decompressed, keep_last, &mut ring, &mut all);
@@ -475,6 +614,10 @@ impl TailFile {
                     });
                     break;
                 }
+            }
+            // Never flush at a scheduling boundary: this is not archive EOF.
+            if keep_last.is_none() && produced >= MAX_OUTPUT_PER_CONSUME {
+                break;
             }
         }
 
@@ -494,7 +637,7 @@ impl TailFile {
         Ok((lines, format_error))
     }
 
-    fn snapshot_end(&mut self) -> Result<Option<u64>, TailError> {
+    fn snapshot_end(&mut self, bounded: bool) -> Result<Option<u64>, TailError> {
         let Some(file) = &self.file else {
             return Ok(None);
         };
@@ -502,10 +645,16 @@ impl TailFile {
             path: self.path.clone(),
             source,
         })?;
-        let len = meta.len();
+        let len = self.drain_end.map_or(meta.len(), |end| meta.len().min(end));
         self.snap_len = len;
         self.snap_mtime = meta.modified().ok();
-        let end = len.min(self.offset.saturating_add(MAX_BYTES_PER_CONSUME));
+        let end = if bounded {
+            len.min(self.offset.saturating_add(MAX_BYTES_PER_CONSUME))
+        } else {
+            // Initial last-N must reach the original snapshot EOF, even for
+            // files larger than a follow poll's fairness budget.
+            len
+        };
         Ok(Some(end))
     }
 
@@ -517,6 +666,18 @@ impl TailFile {
         all: &mut Vec<Vec<u8>>,
     ) {
         if data.is_empty() {
+            return;
+        }
+        if self.batch_output && keep_last.is_none() {
+            self.lines.push_slices(data, |line| {
+                if let Some(last) = all.last_mut() {
+                    if last.len() + line.len() <= DECODE_OUTPUT {
+                        last.extend_from_slice(line);
+                        return;
+                    }
+                }
+                all.push(line.to_vec());
+            });
             return;
         }
         self.lines.push_with(data, |line| match keep_last {
@@ -537,7 +698,7 @@ impl TailFile {
         if self.offset >= limit {
             return Ok(0);
         }
-        let available = (limit - self.offset) as usize;
+        let available = (limit - self.offset).min(CHUNK as u64) as usize;
         if available == 0 {
             return Ok(0);
         }
@@ -578,23 +739,55 @@ impl TailFile {
             return Ok(());
         }
         let mut buf = vec![0u8; want];
-        file.seek(SeekFrom::Start(start))
-            .map_err(|source| TailError::Io {
-                path: self.path.clone(),
-                source,
-            })?;
-        file.read_exact(&mut buf).map_err(|source| TailError::Io {
-            path: self.path.clone(),
-            source,
-        })?;
-        file.seek(SeekFrom::Start(self.offset))
-            .map_err(|source| TailError::Io {
-                path: self.path.clone(),
-                source,
-            })?;
+        match read_exact_at(file, &mut buf, start) {
+            Ok(()) => {}
+            // A racing truncate is handled on the next poll. Do not kill the
+            // file (or disturb its sequential read position) for this race.
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(source) => {
+                return Err(TailError::Io {
+                    path: self.path.clone(),
+                    source,
+                })
+            }
+        }
         self.fingerprint = buf;
         Ok(())
     }
+}
+
+/// Nonblocking open closes the stat/open FIFO race; O_NOCTTY prevents a
+/// substituted terminal device from becoming the process's controlling tty.
+fn open_regular(path: &Path) -> Result<(File, Metadata), TailError> {
+    let io_error = |source| TailError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let meta = std::fs::metadata(path).map_err(io_error)?;
+    require_regular(path, &meta)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+        .map_err(io_error)?;
+    let meta = file.metadata().map_err(io_error)?;
+    require_regular(path, &meta)?;
+    Ok((file, meta))
+}
+
+fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        match file.read_at(buf, offset) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+            Ok(n) => {
+                offset += n as u64;
+                buf = &mut buf[n..];
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 fn require_regular(path: &Path, meta: &Metadata) -> Result<(), TailError> {
@@ -967,5 +1160,301 @@ mod tests {
         let c = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
         let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
         assert_eq!(rc, 0, "mkfifo failed");
+    }
+
+    fn large_records() -> Vec<u8> {
+        let mut data = vec![b'x'; 9 * 1024 * 1024];
+        for i in (1023..data.len()).step_by(1024) {
+            data[i] = b'\n';
+        }
+        data.extend_from_slice(b"last\npartial");
+        data
+    }
+
+    #[test]
+    fn initial_large_plain_seeks_tail_and_preserves_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.txt");
+        write(&path, &large_records());
+        let mut tail = TailFile::open(&path, false).unwrap();
+        let lines = tail.read_initial(1, true).unwrap();
+        assert_eq!(lines, vec![b"last\n".to_vec()]);
+        assert!(tail.bytes_fed() < 2 * DECODE_OUTPUT as u64);
+        assert!(!tail.has_pending_work());
+        append(&path, b" complete\n");
+        assert_eq!(
+            tail.poll().unwrap().lines,
+            vec![b"partial complete\n".to_vec()]
+        );
+    }
+
+    #[test]
+    fn initial_large_stored_gzip_reads_beyond_poll_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.gz");
+        let raw = large_records();
+        let mut enc = GzEncoder::new(Vec::new(), Compression::none());
+        enc.write_all(&raw).unwrap();
+        let compressed = enc.finish().unwrap();
+        assert!(compressed.len() as u64 > MAX_BYTES_PER_CONSUME);
+        write(&path, &compressed);
+        let mut tail = TailFile::open(&path, false).unwrap();
+        assert_eq!(
+            tail.read_initial(1, true).unwrap(),
+            vec![b"last\n".to_vec()]
+        );
+        assert_eq!(tail.bytes_fed(), compressed.len() as u64);
+        assert!(!tail.has_pending_work());
+    }
+
+    #[test]
+    fn zero_lines_skips_all_existing_data_beyond_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        for compressed in [false, true] {
+            let path = dir
+                .path()
+                .join(if compressed { "zero.gz" } else { "zero.txt" });
+            let raw = large_records();
+            write(&path, &if compressed { gz(&raw) } else { raw });
+            let mut tail = TailFile::open(&path, false).unwrap();
+            assert!(tail.read_initial(0, false).unwrap().is_empty());
+            assert!(tail.poll().unwrap().lines.is_empty());
+            let extra = b" done\n";
+            append(
+                &path,
+                &if compressed {
+                    gz(extra)
+                } else {
+                    extra.to_vec()
+                },
+            );
+            assert_eq!(tail.poll().unwrap().lines, vec![b"partial done\n".to_vec()]);
+        }
+    }
+
+    #[test]
+    fn high_ratio_follow_is_output_bounded_and_resumable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bomb.gz");
+        write(&path, b"");
+        let mut tail = TailFile::open(&path, false).unwrap();
+        tail.read_initial(0, false).unwrap();
+        let raw = vec![b'x'; 9 * 1024 * 1024 + 17];
+        append(&path, &gz(&raw));
+        let mut total = 0;
+        let mut polls = 0;
+        loop {
+            let update = tail.poll().unwrap();
+            assert!(update.error.is_none());
+            let bytes: usize = update.lines.iter().map(Vec::len).sum();
+            assert!(bytes <= MAX_OUTPUT_PER_CONSUME + crate::lines::MAX_PARTIAL_LINE);
+            total += bytes;
+            polls += 1;
+            assert!(polls < 30);
+            if !tail.has_pending_work() {
+                break;
+            }
+        }
+        assert!(polls >= 9);
+        assert_eq!(total, 9 * 1024 * 1024);
+        append(&path, &gz(b"\n"));
+        let update = tail.poll().unwrap();
+        assert_eq!(
+            update.lines,
+            vec![[vec![b'x'; 17], b"\n".to_vec()].concat()]
+        );
+    }
+
+    #[test]
+    fn rotation_drains_multiple_output_budgets_before_switching() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rotate.gz");
+        write(&path, b"");
+        let mut tail = TailFile::open(&path, true).unwrap();
+        tail.read_initial(0, false).unwrap();
+        let mut raw = large_records();
+        raw.extend_from_slice(b"\n");
+        append(&path, &gz(&raw));
+        std::fs::rename(&path, dir.path().join("old.gz")).unwrap();
+        write(&path, b"new file\n");
+        let mut got = Vec::new();
+        let mut replaced = false;
+        for _ in 0..30 {
+            let update = tail.poll().unwrap();
+            assert!(update.error.is_none());
+            for line in update.lines {
+                got.extend_from_slice(&line);
+            }
+            if update.notice == Some(Notice::Replaced) {
+                replaced = true;
+                break;
+            }
+        }
+        assert!(replaced);
+        raw.extend_from_slice(b"new file\n");
+        assert_eq!(got, raw);
+    }
+
+    #[test]
+    fn initial_scan_can_be_cancelled() {
+        use std::cell::Cell;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cancel.gz");
+        write(&path, &gz(&vec![b'x'; 4 * 1024 * 1024]));
+        let mut tail = TailFile::open(&path, false).unwrap();
+        let steps = Cell::new(0);
+        let error = tail
+            .read_initial_interruptible(10, true, &|| {
+                steps.set(steps.get() + 1);
+                steps.get() > 3
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), Some(io::ErrorKind::Interrupted));
+    }
+
+    #[test]
+    fn reverse_scan_does_not_sniff_magic_at_a_plain_line_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("magic.txt");
+        let mut raw = vec![b'\n'; CHUNK + 1];
+        raw.extend_from_slice(b"\x1f\x8bnot gzip\n");
+        write(&path, &raw);
+        let mut tail = TailFile::open(&path, false).unwrap();
+        assert_eq!(
+            tail.read_initial(1, true).unwrap(),
+            vec![b"\x1f\x8bnot gzip\n".to_vec()]
+        );
+    }
+
+    #[test]
+    fn open_and_reopen_descriptors_are_nonblocking() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("regular");
+        write(&path, b"hello\n");
+        let mut tail = TailFile::open(&path, true).unwrap();
+        for _ in 0..2 {
+            let fd = tail.file.as_ref().unwrap().as_raw_fd();
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert!(flags >= 0 && flags & libc::O_NONBLOCK != 0);
+            tail.reopen().unwrap();
+        }
+    }
+
+    #[test]
+    fn unlink_drains_old_descriptor_over_multiple_polls() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unlink.gz");
+        write(&path, b"");
+        let mut tail = TailFile::open(&path, true).unwrap();
+        tail.read_initial(0, false).unwrap();
+        let raw = b"old data\n".repeat(400_000);
+        append(&path, &gz(&raw));
+        std::fs::remove_file(&path).unwrap();
+        let mut got = Vec::new();
+        let mut inaccessible = false;
+        for _ in 0..20 {
+            let update = tail.poll().unwrap();
+            assert!(update.error.is_none());
+            for line in update.lines {
+                got.extend_from_slice(&line);
+            }
+            if update.notice == Some(Notice::Inaccessible) {
+                inaccessible = true;
+                break;
+            }
+        }
+        assert!(inaccessible);
+        assert_eq!(got, raw);
+    }
+
+    #[test]
+    fn reverse_scan_matches_forward_for_large_n_and_unterminated_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("records");
+        for trailing_newline in [false, true] {
+            let mut raw = b"hello world\n".repeat(100_000);
+            if !trailing_newline {
+                raw.pop();
+            }
+            write(&path, &raw);
+            for n in [0, 1, 10, 100_001, usize::MAX] {
+                let mut fast = TailFile::open(&path, false).unwrap();
+                let got = fast.read_initial(n, true).unwrap();
+                let mut slow = TailFile::open(&path, false).unwrap();
+                // Consume directly, bypassing the backwards optimization.
+                let (expected, error) = slow.consume(Some(n), true).unwrap();
+                assert!(error.is_none());
+                assert_eq!(got, expected, "n={n}, newline={trailing_newline}");
+                assert_eq!(fast.lines.partial(), slow.lines.partial());
+            }
+        }
+    }
+
+    #[test]
+    fn active_old_writer_cannot_prevent_switching_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("active.log");
+        write(&path, b"");
+        let mut tail = TailFile::open(&path, true).unwrap();
+        tail.read_initial(0, false).unwrap();
+        let raw = b"before rotation\n".repeat(200_000);
+        append(&path, &raw);
+        let old = dir.path().join("old.log");
+        std::fs::rename(&path, &old).unwrap();
+        write(&path, b"new\n");
+        let mut got = Vec::new();
+        let mut replaced = false;
+        for _ in 0..10 {
+            let update = tail.poll().unwrap();
+            for line in update.lines {
+                got.extend_from_slice(&line);
+            }
+            if update.notice == Some(Notice::Replaced) {
+                replaced = true;
+                break;
+            }
+            append(&old, &b"too late\n".repeat(200_000));
+        }
+        assert!(replaced);
+        let mut expected = raw;
+        expected.extend_from_slice(b"new\n");
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn late_appearing_initial_scan_can_be_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("late.gz");
+        let mut tail = TailFile::pending(&path, 10, true);
+        write(&path, &gz(b"data\n"));
+        assert_eq!(
+            tail.poll_interruptible(&|| true).unwrap_err().kind(),
+            Some(io::ErrorKind::Interrupted)
+        );
+    }
+    #[test]
+    fn cli_batches_tiny_lines_without_per_line_allocations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny.gz");
+        write(&path, b"");
+        let mut tail = TailFile::open(&path, false).unwrap();
+        tail.read_initial(0, false).unwrap();
+        let raw = vec![b'\n'; 2 * MAX_OUTPUT_PER_CONSUME + 17];
+        append(&path, &gz(&raw));
+        let mut total = 0;
+        loop {
+            let update = tail.poll_batched(&|| false).unwrap();
+            assert!(update.error.is_none());
+            assert!(update.lines.len() <= MAX_OUTPUT_PER_CONSUME / DECODE_OUTPUT + 1);
+            for batch in update.lines {
+                assert!(batch.iter().all(|&b| b == b'\n'));
+                total += batch.len();
+            }
+            if !tail.has_pending_work() {
+                break;
+            }
+        }
+        assert_eq!(total, raw.len());
     }
 }
