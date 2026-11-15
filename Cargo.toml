@@ -5,6 +5,7 @@ edition = "2021"
 rust-version = "1.85"
 description = "Tail gzip, zstd, and plain text files without re-decompressing"
 readme = "README.md"
+license = "MIT"
 repository = "https://github.com/sfc9982/ztail"
 
 keywords = ["tail", "gzip", "logs", "cli", "zstd"]

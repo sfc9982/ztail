@@ -2,7 +2,7 @@
 
 Reviewed on 2026-11-14, using the projects' own repository documentation and source.
 This is a focused engineering comparison, not a claim that ztail is feature-equivalent.
-No upstream implementation or license text was copied into ztail.
+No upstream implementation was copied into ztail as part of this comparison.
 
 | Reference | Useful practice | ztail change |
 | --- | --- | --- |
@@ -41,8 +41,8 @@ No upstream implementation or license text was copied into ztail.
   ztail remains an incremental tail tool, not a clone of bat/fd/ripgrep.
 - No native Windows or untested CPU targets claimed as supported. More platforms
   require CI, signal/filesystem-event tests, and runnable release verification.
-- No self-update, automatic crates.io publication, or invented license/maintainer
-  contact details. Licensing and final publication authorization remain explicit.
+- No self-update, automatic crates.io publication, or invented maintainer contact
+  details. The maintainer selected MIT; final publication still requires approval.
 
 
 ## Build-info JSON contract

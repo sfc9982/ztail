@@ -177,9 +177,8 @@ exist: this change prepares releases; it does not publish them.
 The release workflow builds static x86_64 Linux musl (minimal) and x86_64 Linux
 glibc (zstd) archives with all completion scripts, docs, and SHA-256 checksums.
 It only creates **draft** releases after tag/version/license checks and tests.
-**A maintainer must choose a distribution license before release:** no license
-is currently declared. See [release checklist](docs/releasing.md) and
-[unreleased changes](CHANGELOG.md).
+The project is MIT-licensed. Publication still requires maintainer review; see
+the [release checklist](docs/releasing.md) and [unreleased changes](CHANGELOG.md).
 
 
 ## Offline manual and Linux integration
@@ -204,3 +203,7 @@ See [Contributing](CONTRIBUTING.md), [Security policy](SECURITY.md), and
 [comparison with mature Rust CLIs](docs/project-conventions.md). Dependency
 advisories and pinned GitHub Actions are maintained separately from core decoding
 logic. The absence of known advisories is not a security guarantee.
+
+## License
+
+Licensed under the [MIT License](LICENSE).

@@ -17,5 +17,6 @@
 - Contributor/security guidance, issue forms, Dependabot, RustSec checks, pinned
   workflow actions, and LF editing conventions.
 
-No public release has been made by this change. Distribution is blocked until
-an authorized maintainer selects and adds the project license.
+- Adopted the MIT license; source and binary packages include the license text.
+
+No public release has been made by this change.

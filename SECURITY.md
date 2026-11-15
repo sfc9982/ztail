@@ -3,8 +3,8 @@
 ## Status and scope
 
 ztail is pre-release. Security fixes are best-effort; there is no promised response
-time or long-term support policy yet. Use a current reviewed revision. Release
-artifacts are not authorized for distribution until a project license is selected.
+time or long-term support policy yet. Use a current reviewed revision. The project
+is MIT-licensed; release publication still requires maintainer review and approval.
 
 Relevant boundaries include compressed-data parsing, decompression amplification,
 resource consumption, file rotation/replacement, filename diagnostics, terminal

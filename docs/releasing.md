@@ -1,12 +1,12 @@
 # Release checklist
 
-## Current blocker: license
+## License verification
 
-This repository has no distribution license yet. The copyright holder must choose
-one, add the full `LICENSE` text (or `LICENSE-*` files), and set `[package].license`
-to its SPDX expression. Packaging and the release workflow intentionally fail
-without both. Do not publish the crate or distribute development archives before
-this is resolved. `--allow-unlicensed` is solely for local/CI packaging tests.
+ztail is licensed under MIT. The full text is in `LICENSE`, and `[package].license`
+is set to `MIT`. Packaging and the release workflow require both metadata and a
+license file; source and binary archives include the text. Review dependency
+licenses and any third-party distribution obligations before publication.
+`--allow-unlicensed` is solely for synthetic/local packaging tests, not releases.
 
 ## Supported release artifacts
 
@@ -20,7 +20,8 @@ this is resolved. `--allow-unlicensed` is solely for local/CI packaging tests.
 
 ## Maintainer steps
 
-1. Resolve the license blocker; review README security boundaries and changelog.
+1. Verify license metadata and included texts; review README security boundaries
+   and changelog.
 2. Set the intended `Cargo.toml` version, regenerate `Cargo.lock`, and update the
    changelog. Run fmt, Clippy, default/all-feature tests, doctests, and MSRV checks.
 3. Run `cargo package --locked --list --allow-dirty` locally to review included files; then

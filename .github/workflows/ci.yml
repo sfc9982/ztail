@@ -137,5 +137,5 @@ jobs:
           python3 scripts/package.py \
             --binary target/x86_64-unknown-linux-musl/release/ztail \
             --target x86_64-unknown-linux-musl --flavor minimal \
-            --output target/dist-smoke --allow-unlicensed
+            --output target/dist-smoke
           (cd target/dist-smoke && sha256sum -c *.sha256)
