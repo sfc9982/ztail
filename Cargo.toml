@@ -13,7 +13,7 @@ categories = ["command-line-utilities", "compression"]
 include = ["src/**", "tests/**", "benches/*.rs", "benches/*.py", "docs/*.md", "scripts/*.py", "README.md", "CHANGELOG.md", "Cargo.toml", "Cargo.lock", "LICENSE*", "build.rs", "Makefile", "CONTRIBUTING.md", "SECURITY.md"]
 
 [dependencies]
-clap_complete = "~4.5.67"
+clap_complete = "~4.6.11"
 clap_mangen = "~0.3.3"
 clap = { version = "4.5", features = ["derive"] }
 crc32fast = "1.4"
