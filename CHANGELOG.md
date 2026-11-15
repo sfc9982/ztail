@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (0.1.0)
+## 0.1.0 — 2026-11-15
 
 - Incremental gzip and optional zstd decoding; plain-text tail and follow.
 - Bounded decode steps, reverse plain-file scanning, buffered output, rotation
@@ -17,6 +17,5 @@
 - Contributor/security guidance, issue forms, Dependabot, RustSec checks, pinned
   workflow actions, and LF editing conventions.
 
+- Compatible with current stable Clippy default-box initialization checks.
 - Adopted the MIT license; source and binary packages include the license text.
-
-No public release has been made by this change.

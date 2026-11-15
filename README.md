@@ -2,9 +2,9 @@
 
 `tail` for gzip files that does **not** re-decompress the file on every poll.
 
-The original Crystal program (branch [`cursor/legacy-crystal-1065`](https://github.com/sfc9982/ztail/tree/cursor/legacy-crystal-1065)) opened the file, inflated it from the first byte, and repeated that every 500 ms. CPU and I/O were proportional to the whole file, forever. This Rust version keeps the file open, remembers the byte offset, and feeds only newly appended bytes into a persistent streaming inflater (`flate2`'s low-level `Decompress`, on the pure-Rust `zlib-rs` backend). Each poll is O(new bytes).
+ztail keeps the file open, remembers the byte offset, and feeds only newly appended bytes into a persistent streaming inflater (`flate2`'s low-level `Decompress`, on the pure-Rust `zlib-rs` backend). Each poll processes only new bytes.
 
-Following is **off by default**, matching GNU `tail`. The old program always followed. Pass `-f` or `-F` when you want that.
+Following is **off by default**, matching GNU `tail`. Pass `-f` or `-F` when you want to follow appends.
 
 ## Build
 
@@ -140,13 +140,6 @@ Coverage needs `cargo-llvm-cov` and the `llvm-tools-preview` component:
 cargo llvm-cov --all-features --lcov --output-path lcov.info
 ```
 
-## Legacy
-
-The original Crystal implementation is preserved on branch
-[`cursor/legacy-crystal-1065`](https://github.com/sfc9982/ztail/tree/cursor/legacy-crystal-1065)
-(`ztail.cr`). It is not part of this tree.
-
-
 ## Shell integration, colors, and language
 
 ```sh
@@ -171,14 +164,14 @@ cargo install --path . --locked --features zstd # adds zstd (C toolchain require
 ```
 
 Native Windows is not supported; use WSL. PowerShell completions are intended for
-`pwsh` on Unix/WSL. Do not assume GitHub binaries or a crates.io package already
-exist: this change prepares releases; it does not publish them.
+`pwsh` on Unix/WSL. GitHub Releases provide Linux binary archives; no crates.io
+publication is configured.
 
 The release workflow builds static x86_64 Linux musl (minimal) and x86_64 Linux
 glibc (zstd) archives with all completion scripts, docs, and SHA-256 checksums.
 It only creates **draft** releases after tag/version/license checks and tests.
 The project is MIT-licensed. Publication still requires maintainer review; see
-the [release checklist](docs/releasing.md) and [unreleased changes](CHANGELOG.md).
+the [release checklist](docs/releasing.md) and [changelog](CHANGELOG.md).
 
 
 ## Offline manual and Linux integration

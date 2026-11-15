@@ -132,7 +132,7 @@ impl Decoder {
                     }
                     Detected::Gzip => {
                         let buffered = take_sniff(&mut self.kind);
-                        self.kind = Kind::Gzip(Box::new(GzipDecoder::new()));
+                        self.kind = Kind::Gzip(Box::default());
                         self.push_decoded(&buffered, out, limit)
                     }
                     Detected::Zstd => {
